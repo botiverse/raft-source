@@ -1,0 +1,1 @@
+ALTER TABLE "oauth_clients" ADD COLUMN "app_type" text DEFAULT 'server_local' NOT NULL;

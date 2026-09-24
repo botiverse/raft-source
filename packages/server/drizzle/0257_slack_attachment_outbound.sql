@@ -1,0 +1,6 @@
+ALTER TABLE "external_outbound_deliveries" DROP CONSTRAINT "external_outbound_delivery_contract_valid";--> statement-breakpoint
+DROP INDEX "uq_external_attachment_message_projection";--> statement-breakpoint
+CREATE UNIQUE INDEX "uq_external_attachment_inbound_projection" ON "external_attachment_message_facts" USING btree ("attachment_projection_id") WHERE "external_attachment_message_facts"."direction" = 'provider_inbound' AND "external_attachment_message_facts"."attachment_projection_id" IS NOT NULL;--> statement-breakpoint
+CREATE UNIQUE INDEX "uq_external_attachment_outbound_projection" ON "external_attachment_message_facts" USING btree ("message_link_id","attachment_projection_id") WHERE "external_attachment_message_facts"."direction" = 'raft_outbound' AND "external_attachment_message_facts"."attachment_projection_id" IS NOT NULL;--> statement-breakpoint
+ALTER TABLE "external_outbound_deliveries" ADD CONSTRAINT "external_outbound_delivery_contract_valid" CHECK ("external_outbound_deliveries"."delivery_contract_version" = 'slack-bridge-delivery.v1'
+      AND "external_outbound_deliveries"."render_snapshot_schema" IN ('slack-bridge-render-snapshot.v1', 'slack-bridge-render-snapshot.v2'));

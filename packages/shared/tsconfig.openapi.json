@@ -1,0 +1,11 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true
+  },
+  "files": [
+    "src/attachmentUploadApi.consumer.ts",
+    "src/generated/openapi.ts"
+  ],
+  "include": []
+}

@@ -1,0 +1,2 @@
+DROP INDEX "idx_channels_server_name_type";--> statement-breakpoint
+CREATE UNIQUE INDEX "idx_channels_server_name_type" ON "channels" USING btree ("server_id","name","type") WHERE type = 'channel' and deleted_at is null;

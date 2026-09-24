@@ -1,0 +1,1 @@
+ALTER TABLE "computer_lifecycle_operations" ADD COLUMN "broadcast_policy_decision" jsonb;

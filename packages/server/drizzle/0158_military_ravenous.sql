@@ -1,0 +1,2 @@
+ALTER TABLE "oauth_clients" DROP CONSTRAINT "oauth_clients_publish_status_valid";--> statement-breakpoint
+ALTER TABLE "oauth_clients" ADD CONSTRAINT "oauth_clients_publish_status_valid" CHECK ("oauth_clients"."publish_status" IN ('private', 'publish_requested', 'in_review', 'published', 'rejected', 'unpublish_requested'));

@@ -1,0 +1,63 @@
+/* Desktop frontend styles: reuse the web app's Tailwind v4 pipeline + design
+ * tokens so reused web components render with their real styles. @source tells
+ * Tailwind to scan the reused web component tree (and our own) for classes. */
+@import "@web/index.css";
+
+@source "../../../../packages/web/src/**/*.{ts,tsx}";
+@source "./**/*.{ts,tsx}";
+
+/* Skin system — alpha-variant re-skinning.
+ * The skin re-colors two ROOT tokens at runtime (skins.ts): --color-soft-signal
+ * (chrome) and --color-brutal-yellow (signal). Their solid utilities re-skin via
+ * var(), but Tailwind bakes the OPACITY variants (e.g. bg-soft-signal at 30pct)
+ * to literal colors at build time. Rebind the baked variants in the bundle to the runtime RGB
+ * channels (--soft-signal-rgb / --brutal-yellow-rgb, also set by skins.ts) so
+ * translucent surfaces and selected/hover tints re-skin too. UNLAYERED so they
+ * win over Tailwind's utilities layer without !important; Electron-only.
+ * (The clean fix is channel-based @theme tokens upstream in raft-ui/web; this is
+ * the bounded desktop-scoped compensation until that graduates.) */
+:root { --soft-signal-rgb: 255 212 64; --brutal-yellow-rgb: 255 212 64; }
+html[data-raft-desktop-shell="electron"] .bg-soft-signal\/15 { background-color: rgb(var(--soft-signal-rgb) / 0.15); }
+html[data-raft-desktop-shell="electron"] .bg-soft-signal\/20 { background-color: rgb(var(--soft-signal-rgb) / 0.20); }
+html[data-raft-desktop-shell="electron"] .bg-soft-signal\/25 { background-color: rgb(var(--soft-signal-rgb) / 0.25); }
+html[data-raft-desktop-shell="electron"] .bg-soft-signal\/30 { background-color: rgb(var(--soft-signal-rgb) / 0.30); }
+html[data-raft-desktop-shell="electron"] .bg-soft-signal\/35 { background-color: rgb(var(--soft-signal-rgb) / 0.35); }
+html[data-raft-desktop-shell="electron"] .bg-soft-signal\/40 { background-color: rgb(var(--soft-signal-rgb) / 0.40); }
+html[data-raft-desktop-shell="electron"] .bg-soft-signal\/70 { background-color: rgb(var(--soft-signal-rgb) / 0.70); }
+html[data-raft-desktop-shell="electron"] .bg-brutal-yellow\/20 { background-color: rgb(var(--brutal-yellow-rgb) / 0.20); }
+html[data-raft-desktop-shell="electron"] .bg-brutal-yellow\/30 { background-color: rgb(var(--brutal-yellow-rgb) / 0.30); }
+html[data-raft-desktop-shell="electron"] .bg-brutal-yellow\/40 { background-color: rgb(var(--brutal-yellow-rgb) / 0.40); }
+html[data-raft-desktop-shell="electron"] .bg-brutal-yellow\/50 { background-color: rgb(var(--brutal-yellow-rgb) / 0.50); }
+
+/* Electron desktop shell adaptations. Gated on html[data-raft-desktop-shell]
+ * (set by desktop/desktopAppAdaptation.ts). These adapt the REUSED web UI to a
+ * frameless native window at runtime — no packages/web edits — so they target
+ * either desktop-owned markers (data-raft-titlebar, on our DesktopTopBar / login
+ * strip) or the web's own stable testids / structure.
+ * - Title bars become draggable regions (interactive children opt back out), with
+ *   a left inset reserving space for the macOS traffic lights.
+ * - The desktop top bar hosts Search + the workspace switcher, so the LeftRail's
+ *   redundant Search tab and top server-switcher cell are hidden. */
+html[data-raft-desktop-shell="electron"] [data-raft-titlebar] {
+  -webkit-app-region: drag;
+  padding-left: 82px;
+}
+html[data-raft-desktop-shell="electron"] [data-raft-titlebar]
+  :is(button, a, input, select, textarea, [role="button"], [contenteditable="true"]) {
+  -webkit-app-region: no-drag;
+}
+html[data-raft-desktop-shell="electron"] [data-testid="left-rail-tab-search"] {
+  display: none !important;
+}
+/* The rail's top server-switcher cell is the first child of the left workspace
+ * rail (LeftRail renders it first when side === "left"). */
+html[data-raft-desktop-shell="electron"] [data-testid="workspace-left-rail"] > div:first-child {
+  display: none !important;
+}
+/* Drop the redundant sidebar panel title box (计算机 / 成员 / 聊天) that just
+ * repeats the functional panel header right below it (@WAWQAQ 2026-09-09). On
+ * the desktop shell the sidebar is always the non-mobile layout, so this title
+ * header (`!mobileInline`) is sidebar-root's first child. Desktop-only. */
+html[data-raft-desktop-shell="electron"] [data-testid="sidebar-root"] > div:first-child {
+  display: none !important;
+}

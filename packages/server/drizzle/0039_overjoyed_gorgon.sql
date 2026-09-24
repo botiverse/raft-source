@@ -1,0 +1,2 @@
+ALTER TABLE "messages" ADD COLUMN "agent_send_key" text;--> statement-breakpoint
+CREATE UNIQUE INDEX "idx_messages_agent_send_key" ON "messages" USING btree ("sender_id","agent_send_key") WHERE sender_type = 'agent' and agent_send_key is not null;

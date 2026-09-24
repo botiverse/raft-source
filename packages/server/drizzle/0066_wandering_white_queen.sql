@@ -1,0 +1,3 @@
+ALTER TABLE "agent_activity_events" ADD COLUMN "dedupe_key" text;--> statement-breakpoint
+COMMENT ON COLUMN "agent_activity_events"."dedupe_key" IS 'Optional semantic idempotency key for user-visible Activity Log projections. Non-null values are unique per agent via partial index; NULL preserves append-only legacy and ordinary activity. This is projection dedupe, not lifecycle event identity, trace identity, or incident correlation.';--> statement-breakpoint
+CREATE UNIQUE INDEX "idx_agent_activity_events_agent_dedupe" ON "agent_activity_events" USING btree ("agent_id","dedupe_key") WHERE "agent_activity_events"."dedupe_key" IS NOT NULL;

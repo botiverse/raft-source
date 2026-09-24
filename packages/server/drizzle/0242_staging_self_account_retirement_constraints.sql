@@ -1,0 +1,1 @@
+ALTER TABLE "user_retirement_receipts" ADD CONSTRAINT "user_retirement_receipts_sessions_revoked_nonnegative" CHECK ("user_retirement_receipts"."sessions_revoked" >= 0);

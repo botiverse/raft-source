@@ -1,0 +1,2 @@
+ALTER TABLE "reminders" ADD COLUMN "target_channel_id" uuid;--> statement-breakpoint
+ALTER TABLE "reminders" ADD CONSTRAINT "reminders_target_channel_id_channels_id_fk" FOREIGN KEY ("target_channel_id") REFERENCES "public"."channels"("id") ON DELETE set null ON UPDATE no action;

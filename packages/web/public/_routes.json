@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "include": [
+    "/.well-known/*",
+    "/assets/*",
+    "/desktop-manifest.json"
+  ],
+  "exclude": []
+}

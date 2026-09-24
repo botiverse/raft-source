@@ -1,0 +1,21 @@
+emit:
+  - "@typespec/json-schema"
+  - "@typespec/openapi3"
+
+options:
+  "@typespec/json-schema":
+    emitter-output-dir: "{output-dir}/json-schema"
+    file-type: json
+    emitAllModels: true
+    seal-object-schemas: true
+    polymorphic-models-strategy: oneOf
+    bundleId: activity-sync.schema.json
+  "@typespec/openapi3":
+    emitter-output-dir: "{output-dir}/openapi"
+    file-type: json
+    openapi-versions:
+      - "3.1.0"
+    seal-object-schemas: true
+
+output-dir: "{project-root}/generated"
+warn-as-error: true

@@ -1,0 +1,1 @@
+ALTER TABLE "servers" ADD COLUMN "plan" text DEFAULT 'free' NOT NULL;

@@ -1,0 +1,499 @@
+.workspace-grid-demo-shell {
+  --workspace-grid-ink: #141111;
+  --workspace-grid-paper: #ffffff;
+  --workspace-grid-active: var(--color-soft-signal);
+  --workspace-grid-drop-fill: rgb(0 220 255 / 8%);
+  --workspace-grid-drop-fill-active: rgb(0 220 255 / 16%);
+  --workspace-grid-drop-line: rgb(0 150 190 / 50%);
+  background: var(--workspace-grid-paper);
+}
+
+.workspace-grid-demo-shell .flexlayout__layout {
+  --color-drag1: var(--workspace-grid-drop-line);
+  --color-drag2: var(--workspace-grid-drop-line);
+  --color-drag1-background: var(--workspace-grid-drop-fill-active);
+  --color-drag2-background: var(--workspace-grid-drop-fill-active);
+  --color-drag-rect-border: var(--workspace-grid-drop-line);
+  --color-drag-rect-background: var(--workspace-grid-drop-fill);
+  --color-drag-rect: var(--workspace-grid-ink);
+  --color-edge-marker: var(--workspace-grid-drop-fill);
+  --color-edge-icon: rgb(0 120 150 / 70%);
+  --color-splitter-drag: var(--workspace-grid-ink);
+  --splitter-size: 1px;
+  --splitter-active-size: 8px;
+  background: var(--workspace-grid-paper);
+  color: var(--workspace-grid-ink);
+}
+
+.workspace-grid-demo-shell .flexlayout__splitter {
+  background: rgb(20 17 17 / 25%);
+}
+
+.workspace-grid-demo-shell .flexlayout__splitter:hover {
+  background: var(--workspace-grid-ink);
+}
+
+.workspace-grid-demo-shell .flexlayout__splitter_drag {
+  background: var(--workspace-grid-ink);
+  border: 0;
+  border-radius: 0;
+}
+
+.workspace-grid-demo-shell .flexlayout__outline_rect,
+.workspace-grid-demo-shell .flexlayout__outline_rect_edge {
+  background: var(--workspace-grid-drop-fill-active);
+  border: 1px solid var(--workspace-grid-drop-line);
+  border-radius: 4px;
+  box-shadow: none;
+}
+
+.workspace-grid-demo-shell .flexlayout__outline_rect[data-workspace-drop-kind="insertion"] {
+  background: var(--workspace-grid-drop-fill-active);
+  border: 1px solid var(--workspace-grid-drop-line);
+  border-radius: 4px;
+}
+
+.workspace-grid-demo-shell .flexlayout__edge_rect {
+  color: rgb(0 120 150 / 70%);
+  background: var(--workspace-grid-drop-fill);
+  border: 1px solid rgb(0 150 190 / 45%);
+  border-radius: 4px !important;
+  box-shadow: none;
+  opacity: 1;
+}
+
+.workspace-grid-demo-shell .flexlayout__edge_rect svg {
+  display: block;
+  color: currentColor;
+}
+
+.workspace-grid-demo-shell .flexlayout__drag_rect {
+  color: var(--workspace-grid-ink);
+  background: var(--workspace-grid-drop-fill);
+  border: 1px solid var(--workspace-grid-drop-line);
+  border-radius: 4px;
+  box-shadow: none;
+  font-family: inherit;
+  font-weight: 600;
+}
+
+/* The native drag image is portaled under body, outside the layout shell. */
+.workspace-grid-drag-theme .flexlayout__layout.flexlayout__drag_rect {
+  --color-drag-rect-border: rgb(0 150 190 / 50%);
+  --color-drag-rect-background: rgb(0 220 255 / 8%);
+  --color-drag-rect: var(--workspace-grid-ink, #141111);
+  color: var(--workspace-grid-ink, #141111);
+  background: rgb(0 220 255 / 8%);
+  border: 1px solid rgb(0 150 190 / 50%);
+  border-radius: 4px;
+  box-shadow: none;
+  font-family: inherit;
+  font-weight: 600;
+}
+
+.workspace-grid-external-drag-active [data-testid$="-sidebar-resize-handle"] {
+  pointer-events: none;
+}
+
+.workspace-grid-demo-shell .flexlayout__tabset {
+  background: var(--workspace-grid-paper);
+}
+
+.workspace-grid-demo-shell .flexlayout__tabset_tabbar_outer {
+  align-items: stretch;
+  box-sizing: border-box;
+  height: 48px;
+  min-height: 48px;
+  background: var(--workspace-grid-paper);
+  border-top: 2px solid transparent;
+  border-bottom: 1px solid rgb(20 17 17 / 25%);
+}
+
+.workspace-grid-demo-shell .flexlayout__tabset_tabbar_outer.flexlayout__tabset-selected {
+  border-top-color: var(--workspace-grid-active);
+}
+
+.workspace-grid-demo-shell .flexlayout__tabset_tabbar_outer_top {
+  padding: 0;
+}
+
+.workspace-grid-demo-shell .flexlayout__tabset_leading {
+  display: flex;
+  flex: 0 0 auto;
+  align-self: stretch;
+}
+
+.workspace-grid-demo-shell .workspace-grid-tab-search-trigger {
+  display: inline-flex;
+  width: 40px;
+  height: calc(100% - 2px);
+  align-items: center;
+  justify-content: center;
+  color: var(--workspace-grid-ink);
+  background: var(--color-brutal-cream);
+  border: 0;
+  border-right: 1px solid rgb(20 17 17 / 25%);
+}
+
+.workspace-grid-demo-shell .workspace-grid-tab-search-trigger:hover {
+  background: var(--color-soft-signal);
+}
+
+.workspace-grid-demo-shell .workspace-grid-tab-search-trigger:focus-visible {
+  outline: 1px solid var(--workspace-grid-ink);
+  outline-offset: -1px;
+}
+
+.workspace-grid-demo-shell .flexlayout__tab_button_overflow {
+  display: none;
+}
+
+.workspace-grid-demo-shell .flexlayout__tabset_tabbar_inner {
+  align-items: stretch;
+  height: 48px;
+  gap: 0;
+  padding: 0;
+}
+
+.workspace-grid-demo-shell .flexlayout__mini_scrollbar_container {
+  min-width: 0;
+}
+
+.workspace-grid-demo-shell .flexlayout__tabset_tabbar_inner_tab_container {
+  align-items: stretch;
+  height: 48px;
+  min-width: 100%;
+  padding: 0;
+}
+
+.workspace-grid-demo-shell .flexlayout__tabset_tabbar_inner_tab_container_top {
+  border-top: 0;
+}
+
+.workspace-grid-demo-shell .flexlayout__tab_button {
+  align-self: stretch;
+  height: 100%;
+  min-width: 88px;
+  max-width: 220px;
+  min-height: 48px;
+  margin: 0;
+  gap: 8px;
+  padding: 0 10px;
+  color: var(--workspace-grid-ink);
+  background: var(--workspace-grid-paper);
+  border: 0;
+  border-right: 1px solid rgb(20 17 17 / 24%);
+  border-radius: 0;
+  font-size: 13px;
+  font-weight: 700;
+  opacity: 1;
+}
+
+.workspace-grid-demo-shell .flexlayout__tab_button:first-child {
+  border-left: 0;
+}
+
+.workspace-grid-demo-shell .flexlayout__tab_button:hover {
+  background: var(--color-brutal-cream);
+}
+
+.workspace-grid-demo-shell .flexlayout__tab_button:focus-visible,
+.workspace-grid-demo-shell[data-workspace-keyboard-focus="true"] .flexlayout__tab_button[aria-selected="true"]:focus {
+  outline: 1px solid var(--workspace-grid-ink) !important;
+  outline-offset: -1px !important;
+}
+
+.workspace-grid-demo-shell .flexlayout__tabset_tabbar_outer.flexlayout__tabset-selected:has(.flexlayout__tab_button:focus-visible),
+.workspace-grid-demo-shell[data-workspace-keyboard-focus="true"] .flexlayout__tabset_tabbar_outer.flexlayout__tabset-selected:has(.flexlayout__tab_button[aria-selected="true"]:focus) {
+  outline: 1px solid var(--workspace-grid-ink) !important;
+  outline-offset: -1px !important;
+}
+
+.workspace-grid-demo-shell .flexlayout__tab_button--selected {
+  position: relative;
+  margin: 0;
+  min-height: 100%;
+  background: var(--workspace-grid-paper);
+  border-top: 0;
+  border-right: 1px solid rgb(20 17 17 / 24%);
+  border-bottom: 2px solid var(--workspace-grid-paper);
+  z-index: 2;
+}
+
+.workspace-grid-demo-shell .flexlayout__tab_button--selected:first-child {
+  border-left: 0;
+}
+
+.workspace-grid-demo-shell .flexlayout__tab_button_content {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-grid-demo-shell .flexlayout__tab_button:has(.workspace-grid-pinned-tab-label) {
+  width: 48px;
+  min-width: 48px;
+  max-width: 48px;
+  justify-content: center;
+  gap: 0;
+  padding-inline: 0;
+}
+
+.workspace-grid-demo-shell .flexlayout__tab_button:has(.workspace-grid-pinned-tab-label) .flexlayout__tab_button_trailing {
+  display: none;
+}
+
+.workspace-grid-demo-shell .flexlayout__tab_button_trailing {
+  width: 24px;
+  height: 24px;
+  margin-left: 0;
+  opacity: 0;
+  transition: opacity 120ms ease;
+  align-items: center;
+  justify-content: center;
+  border-radius: 9999px;
+  color: rgb(20 17 17 / 40%);
+  background: transparent;
+}
+
+.workspace-grid-demo-shell .flexlayout__tab_button_trailing:hover {
+  background: rgb(20 17 17 / 8%);
+  color: var(--workspace-grid-ink);
+}
+
+.workspace-grid-demo-shell .flexlayout__tab_button:hover .flexlayout__tab_button_trailing,
+.workspace-grid-demo-shell .flexlayout__tab_button--selected .flexlayout__tab_button_trailing {
+  opacity: 1;
+}
+
+.workspace-grid-demo-shell .flexlayout__tab_button_trailing button,
+.workspace-grid-demo-shell .flexlayout__tab_button_trailing svg {
+  color: inherit;
+}
+
+.workspace-grid-demo-shell .flexlayout__tab_button_trailing svg {
+  width: 16px;
+  height: 16px;
+}
+
+.workspace-grid-demo-shell .flexlayout__tab_button_trailing:focus-visible,
+.workspace-grid-demo-shell .flexlayout__tab_button_trailing button:focus-visible {
+  outline: 1px solid var(--workspace-grid-ink);
+  outline-offset: 1px;
+}
+
+.workspace-grid-demo-shell .flexlayout__tab_toolbar {
+  position: relative;
+  z-index: 3;
+  flex: 0 0 auto;
+  align-self: stretch;
+  height: 48px;
+  min-height: 48px;
+  margin-left: auto;
+  background: var(--workspace-grid-paper);
+  border-left: 1px solid rgb(20 17 17 / 25%);
+}
+
+.workspace-grid-demo-shell .flexlayout__tab_toolbar:empty {
+  display: none;
+}
+
+/* FlexLayout still mounts its native overflow button after we replace it with
+   the leading overview control. Collapse that hidden-only toolbar so it cannot
+   leave a bordered blank box at the end of a clipped tab strip. */
+.workspace-grid-demo-shell .flexlayout__tab_toolbar:has(> .flexlayout__tab_button_overflow):not(:has(> :not(.flexlayout__tab_button_overflow):not(.workspace-grid-tabset-action-host:empty))) {
+  display: none;
+}
+
+.workspace-grid-demo-shell .flexlayout__tab_toolbar_button {
+  color: var(--workspace-grid-ink);
+}
+
+.workspace-grid-demo-shell .workspace-grid-tabset-action-host,
+.workspace-grid-demo-shell .workspace-grid-tabset-actions {
+  display: flex;
+  height: 100%;
+  align-items: center;
+}
+
+.workspace-grid-demo-shell .workspace-grid-tabset-actions {
+  gap: 6px;
+  padding: 0 6px;
+}
+
+.workspace-grid-demo-shell .flexlayout__tab {
+  background: var(--workspace-grid-paper);
+  color: var(--workspace-grid-ink);
+}
+
+.workspace-grid-demo-shell .flexlayout__tabset-selected {
+  background: var(--workspace-grid-paper);
+  z-index: 1;
+}
+
+.workspace-grid-demo-shell,
+.workspace-scrollbar-subtle {
+  scrollbar-width: thin;
+  scrollbar-color: rgb(20 17 17 / 18%) transparent;
+}
+
+.workspace-grid-demo-shell *::-webkit-scrollbar,
+.workspace-scrollbar-subtle *::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.workspace-grid-demo-shell *::-webkit-scrollbar-track,
+.workspace-scrollbar-subtle *::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.workspace-grid-demo-shell *::-webkit-scrollbar-thumb,
+.workspace-scrollbar-subtle *::-webkit-scrollbar-thumb {
+  min-height: 28px;
+  border: 2px solid transparent;
+  border-radius: 9999px;
+  background: rgb(20 17 17 / 18%);
+  background-clip: content-box;
+  box-shadow: none;
+}
+
+.workspace-grid-demo-shell *::-webkit-scrollbar-thumb:hover,
+.workspace-scrollbar-subtle *::-webkit-scrollbar-thumb:hover {
+  background: rgb(20 17 17 / 30%);
+  background-clip: content-box;
+}
+
+.workspace-grid-demo-shell *::-webkit-scrollbar-thumb:active,
+.workspace-scrollbar-subtle *::-webkit-scrollbar-thumb:active {
+  background: rgb(20 17 17 / 45%);
+  background-clip: content-box;
+}
+
+.workspace-grid-demo-shell *::-webkit-scrollbar-button,
+.workspace-scrollbar-subtle *::-webkit-scrollbar-button {
+  display: none;
+}
+
+.workspace-grid-demo-shell .workspace-grid-agent-secondary-nav [data-slot="tabs"] {
+  border-bottom-width: 1px;
+  border-bottom-color: rgb(20 17 17 / 18%);
+}
+
+.workspace-grid-demo-shell .workspace-grid-agent-secondary-nav [data-slot="tabs-list"] {
+  border-right-width: 0;
+  border-color: rgb(20 17 17 / 18%);
+}
+
+.workspace-grid-demo-shell .workspace-grid-agent-secondary-nav [data-slot="tabs-tab"] {
+  min-height: 32px;
+  border-width: 0 1px 0 0;
+  border-color: rgb(20 17 17 / 18%);
+  background: transparent;
+  box-shadow: none;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.workspace-grid-demo-shell .workspace-grid-agent-secondary-nav [data-slot="tabs-tab"][data-active] {
+  background: rgb(20 17 17 / 6%);
+  color: var(--workspace-grid-ink);
+}
+
+/* Workspace host overrides dimensions without changing shared panel markup,
+   default props, or classic-route styles. */
+.workspace-grid-chrome-density .h-panel-header {
+  height: 48px;
+  min-height: 48px;
+  gap: 12px;
+  padding: 0 16px;
+  border-bottom-width: 1px;
+}
+
+.workspace-grid-chrome-density .h-panel-header .size-icon-header {
+  width: 28px;
+  height: 28px;
+  border-width: 1px;
+}
+
+.workspace-grid-chrome-density .h-panel-header h2 {
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.workspace-grid-chrome-density .h-panel-header p {
+  font-size: 11px;
+  line-height: 14px;
+}
+
+.workspace-grid-chrome-density .h-panel-header button {
+  min-width: 28px;
+  min-height: 28px;
+}
+
+.workspace-grid-panel-toolbar,
+.workspace-grid-demo-shell .workspace-grid-chrome-density .shrink-0.border-b-2.border-black.bg-white.px-4.py-3 {
+  display: flex;
+  height: 40px;
+  min-height: 40px;
+  align-items: center;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  padding: 0 12px;
+  border-bottom-width: 1px;
+  scrollbar-width: none;
+}
+
+.workspace-grid-panel-toolbar::-webkit-scrollbar,
+.workspace-grid-demo-shell .workspace-grid-chrome-density .shrink-0.border-b-2.border-black.bg-white.px-4.py-3::-webkit-scrollbar {
+  display: none;
+}
+
+.workspace-grid-panel-toolbar > div,
+.workspace-grid-demo-shell .workspace-grid-chrome-density .shrink-0.border-b-2.border-black.bg-white.px-4.py-3 > div {
+  min-width: max-content;
+  flex: 0 0 auto;
+  flex-wrap: nowrap;
+}
+
+.workspace-grid-toolbar-overflow-cue {
+  background: linear-gradient(to left, var(--workspace-grid-paper) 20%, transparent);
+}
+
+.workspace-grid-panel-content,
+.workspace-grid-panel-content > * {
+  min-width: 0;
+  max-width: 100%;
+}
+
+/* The canonical Tasks board is a wide horizontal canvas. Inside a Workspace
+   Sidebar, adapt only its host instance into bounded, full-width columns so
+   task cards wrap within the Sidebar instead of painting under the editor. */
+.workspace-grid-chrome-tasks [data-testid="channel-task-board-view"] {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  flex-direction: column;
+  padding-right: 0;
+}
+
+.workspace-grid-chrome-tasks [data-testid="channel-task-board-view"] > * {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.workspace-grid-demo-shell .workspace-grid-tab-pin {
+  display: flex;
+  width: 16px;
+  height: 16px;
+  flex: 0 0 16px;
+  align-items: center;
+  justify-content: center;
+  color: var(--workspace-grid-ink);
+}
+
+.workspace-grid-demo-channel-strip button {
+  cursor: default;
+}

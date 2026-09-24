@@ -1,0 +1,1 @@
+ALTER TABLE "agent_migrations" ALTER COLUMN "transport_max_bytes" SET DATA TYPE bigint;

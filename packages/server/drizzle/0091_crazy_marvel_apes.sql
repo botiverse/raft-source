@@ -1,0 +1,1 @@
+ALTER TABLE "daemons" ADD COLUMN "legacy_key_migrated_at" timestamp with time zone;

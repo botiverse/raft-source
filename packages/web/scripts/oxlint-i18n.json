@@ -1,0 +1,54 @@
+{
+  "jsPlugins": [
+    { "name": "formatjs", "specifier": "eslint-plugin-formatjs" },
+    "./oxlint-plugins/raft-i18n/index.mjs"
+  ],
+  "categories": {
+    "correctness": "off"
+  },
+  "rules": {
+    "formatjs/no-literal-string-in-jsx": [
+      "error",
+      {
+        "props": {
+          "include": [
+            ["*", "confirmLabel"],
+            ["*", "loadingLabel"],
+            ["*", "message"],
+            ["*", "label"],
+            ["*", "description"],
+            ["*", "summary"],
+            ["*", "details"],
+            ["*", "title"],
+            ["*", "ariaLabel"],
+            ["*", "copiedLabel"],
+            ["*", "copyLabel"],
+            ["*", "pinLabel"],
+            ["*", "unpinLabel"],
+            ["*", "collapsedLabel"],
+            ["*", "expandedLabel"],
+            ["*", "envVarsHint"],
+            ["*", "reason"]
+          ]
+        }
+      }
+    ],
+    "formatjs/no-literal-string-in-object": [
+      "error",
+      {
+        "include": [
+          "label",
+          "title",
+          "summary",
+          "details",
+          "description",
+          "message",
+          "subtitle",
+          "contextLoadError"
+        ]
+      }
+    ],
+    "raft-i18n/no-literal-in-message-call": "error",
+    "raft-i18n/no-literal-return-prose": "error"
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "name": "@botiverse/raft-trace-upload-worker",
+  "version": "0.1.0",
+  "license": "FSL-1.1-ALv2",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev --local --port ${PORT:-8787} --var SCOPE_ATTESTATION_SECRET:${SCOPE_ATTESTATION_SECRET:-dev-scope-attestation-secret} --var TRACE_UPLOAD_WORKER_SECRET:${TRACE_UPLOAD_WORKER_SECRET:-dev-trace-upload-worker-secret} --var TRACE_UPLOAD_MAX_BYTES:${TRACE_UPLOAD_MAX_BYTES:-52428800} --var TRACE_INGEST_OTLP_ENDPOINT:${TRACE_INGEST_OTLP_ENDPOINT:-} --var TRACE_INGEST_SERVICE_NAME:${TRACE_INGEST_SERVICE_NAME:-} --var TRACE_WEB_CORS_ORIGIN:${TRACE_WEB_CORS_ORIGIN:-} --var DEPLOYMENT_ENV:${DEPLOYMENT_ENV:-} --var FEEDBACK_REPORT_MAX_BYTES:${FEEDBACK_REPORT_MAX_BYTES:-} --var FEEDBACK_REPORT_HOURLY_LIMIT:${FEEDBACK_REPORT_HOURLY_LIMIT:-}",
+    "start": "tsx src/node.ts",
+    "test": "node --import tsx --test 'src/**/*.test.ts'",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@botiverse/raft-shared": "workspace:*",
+    "scopedb": "0.2.2"
+  },
+  "devDependencies": {
+    "@botiverse/raft-trace-client": "workspace:*",
+    "@types/node": "^25.5.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3",
+    "wrangler": "^4.50.0"
+  }
+}

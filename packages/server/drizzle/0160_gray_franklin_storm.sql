@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX "idx_users_name_exact_unique" ON "users" USING btree ("name");

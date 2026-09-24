@@ -1,0 +1,3 @@
+ALTER TABLE "agent_knowledge_events" ADD COLUMN "operation" text;--> statement-breakpoint
+ALTER TABLE "agent_knowledge_events" ADD CONSTRAINT "agent_knowledge_events_operation_valid" CHECK ("agent_knowledge_events"."operation" IS NULL OR "agent_knowledge_events"."operation" IN ('get', 'search'));--> statement-breakpoint
+ALTER TABLE "agent_knowledge_events" ADD CONSTRAINT "agent_knowledge_events_resolution_valid" CHECK ("agent_knowledge_events"."resolution" IS NULL OR "agent_knowledge_events"."resolution" IN ('exact_id', 'alias', 'token_route', 'lexical', 'concept_expansion', 'typo_correction', 'mixed', 'language_gate'));

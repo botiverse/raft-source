@@ -1,0 +1,78 @@
+# electron-builder config for @botiverse/raft-computer-app (menu-bar mode
+# on macOS, windowed fallback elsewhere).
+#
+# This is the shared app/package shape. The ordinary build workflow keeps its
+# dev/QA artifact unsigned by setting `CSC_IDENTITY_AUTO_DISCOVERY=false`.
+# Formal release builds extend this file via `electron-builder.release.yml`,
+# require Developer ID signing, and notarize the resulting DMG before publish.
+
+appId: build.raft.computer-app
+productName: Raft Computer
+artifactName: ${productName}-${version}-${arch}.${ext}
+
+directories:
+  output: release
+  buildResources: assets
+
+files:
+  - dist/**/*
+  - package.json
+  - "!**/*.{md,ts,map}"
+
+# Tray icons resolved at runtime by `trayIconBasename()` in src/main.ts via
+# `process.resourcesPath`. Three health states ship:
+#   - iconTemplate.png       — ok (auto-tinted by macOS)
+#   - iconAttention.png      — degraded (orange, not a template)
+#   - iconDimmedTemplate.png — stopped (template, lower alpha)
+# Each has a `@2x.png` retina sibling.
+# CLI bundle (task #113): the agent runtime (claude driver) needs the bundled
+# `raft` CLI to spawn. The daemon core is tsup-inlined into this app, so its
+# relative `resolveRaftCliPath` can't find a sidecar — we ship the CLI here
+# at `<resources>/cli/index.js` and `src/main.ts` hands its path to the daemon
+# via `RAFT_COMPUTER_CLI_PATH`. (Build order: `@botiverse/raft` must be built
+# before packaging — see `build:deps`.)
+extraResources:
+  - from: ../../packages/cli/dist/index.js
+    to: cli/index.js
+  - from: assets
+    to: assets
+    filter:
+      - "iconTemplate*.png"
+      - "iconAttention*.png"
+      - "iconDimmedTemplate*.png"
+
+mac:
+  # Menu-bar app on macOS: hide the dock icon. LSUIElement: true marks the
+  # app as a "UI element" (not a regular foreground app), so it doesn't
+  # show in the dock or Cmd+Tab. The tray icon is the user-facing surface.
+  # `app.dock.hide()` in main.ts handles dev runs (no plist applied), but
+  # the plist is what drives Finder / Launch Services for packaged builds.
+  extendInfo:
+    LSUIElement: true
+  category: public.app-category.developer-tools
+  # App-bundle icon (Finder / dialogs / About). The Raft brand mark composed
+  # onto the Apple-HIG macOS rounded-rect "card" (10% padding + subtle shadow)
+  # — NOT the tray glyphs above, which are status indicators. Generated from
+  # the Raft mark via scripts/generate-app-icons.py.
+  icon: assets/icon.icns
+  target:
+    - target: dmg
+      arch:
+        - x64
+        - arm64
+  hardenedRuntime: true
+  gatekeeperAssess: false
+
+# Windowed fallback on Windows. Full-bleed square Raft mark (Windows does not
+# inset/round the icon the way macOS does, so no HIG card here).
+win:
+  icon: assets/icon.ico
+  target:
+    - target: nsis
+      arch:
+        - x64
+
+dmg:
+  sign: false
+
+afterSign: null

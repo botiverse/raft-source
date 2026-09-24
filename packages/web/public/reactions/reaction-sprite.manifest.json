@@ -1,0 +1,74 @@
+{
+  "version": 1,
+  "spritePath": "/reactions/reaction-sprite.svg",
+  "spriteWidth": 168,
+  "spriteHeight": 24,
+  "items": [
+    {
+      "id": "thumbs_up",
+      "emoji": "👍",
+      "label": "Thumbs up",
+      "x": 0,
+      "y": 0,
+      "width": 24,
+      "height": 24
+    },
+    {
+      "id": "heart",
+      "emoji": "❤️",
+      "aliases": [
+        "❤"
+      ],
+      "label": "Heart",
+      "x": 24,
+      "y": 0,
+      "width": 24,
+      "height": 24
+    },
+    {
+      "id": "party_popper",
+      "emoji": "🎉",
+      "label": "Party popper",
+      "x": 48,
+      "y": 0,
+      "width": 24,
+      "height": 24
+    },
+    {
+      "id": "eyes",
+      "emoji": "👀",
+      "label": "Eyes",
+      "x": 72,
+      "y": 0,
+      "width": 24,
+      "height": 24
+    },
+    {
+      "id": "fire",
+      "emoji": "🔥",
+      "label": "Fire",
+      "x": 96,
+      "y": 0,
+      "width": 24,
+      "height": 24
+    },
+    {
+      "id": "joy",
+      "emoji": "😂",
+      "label": "Face with tears of joy",
+      "x": 120,
+      "y": 0,
+      "width": 24,
+      "height": 24
+    },
+    {
+      "id": "check_mark",
+      "emoji": "✅",
+      "label": "Check mark",
+      "x": 144,
+      "y": 0,
+      "width": 24,
+      "height": 24
+    }
+  ]
+}

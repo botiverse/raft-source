@@ -1,0 +1,289 @@
+{
+  // Oxlint config — JSONC supported (// + /* */ + trailing commas).
+  // Reads .oxlintrc.json by default. ESLint v8 schema-compatible.
+  //
+  // Scope: packages/web only. Bootstrap PR — wires the linter as
+  // report-only (no CI gate) per xxchan #proj-frontend:4d5df538.
+  // Promotions / new rules land as follow-up PRs.
+
+  "jsPlugins": [
+    { "name": "react-doctor", "specifier": "oxlint-plugin-react-doctor" }
+  ],
+  "plugins": ["typescript", "import"],
+
+  "rules": {
+    // Keep unused bindings out of application code. Import fixes are safe and
+    // available to `pnpm lint:fix`; local-variable removal remains manual
+    // because initializers may have side effects.
+    "no-unused-vars": [
+      "error",
+      {
+        "argsIgnorePattern": "^_",
+        "caughtErrorsIgnorePattern": "^_",
+        "varsIgnorePattern": "^_",
+        "fix": {
+          "imports": "safe-fix",
+          "variables": "off"
+        }
+      }
+    ],
+
+    // Mark type-only bindings as separate `import type` declarations. Keep
+    // `import()` type annotations available for lazy module-shape declarations:
+    // Oxlint reports those by default but cannot rewrite them with `--fix`.
+    "typescript/consistent-type-imports": [
+      "error",
+      {
+        "prefer": "type-imports",
+        "fixStyle": "separate-type-imports",
+        "disallowTypeAnnotations": false
+      }
+    ],
+
+    // `fixStyle` only controls fixes for unmarked type-only imports. This
+    // companion rule also rejects existing inline `type` specifiers so the
+    // separate-declaration style stays enforced.
+    "import/consistent-type-specifier-style": [
+      "error",
+      "prefer-top-level"
+    ],
+    // Loading the import plugin also exposes two correctness-category rules.
+    // Keep this migration scoped to type-import placement only.
+    "import/default": "off",
+    "import/namespace": "off",
+
+    // React's automatic JSX runtime does not need the legacy default import.
+    // Prefer named imports for APIs/types; whole-module test shims must carry
+    // a documented, line-scoped exception.
+    "no-restricted-imports": [
+      "error",
+      {
+        "paths": [
+          {
+            "name": "react",
+            "importNames": ["default"],
+            "message": "Use named React imports; namespace imports require a documented whole-module exception."
+          }
+        ]
+      }
+    ],
+
+    // ── no-derived-state promoted to error (lint promotion). The full
+    // react-doctor no-derived-state inventory (31 sites) was cleared across
+    // PR #2524/#2527/#2529/#2530 (effect-fix + idempotency-lock useRef +
+    // documented-FP inline-disables). Gating locks the clean state.
+    "react-doctor/no-derived-state": "error",
+    // ── no-derived-state-effect (sister rule) promoted to error. 5 sites
+    // cleared: 4 external-store-write / legit FPs inline-disabled in PR #2536
+    // (MessageInput / MainLayout / OwnerOnboardingModal / MessageSearchPage);
+    // last site SettingsPanel server-switch form re-sync inline-disabled in
+    // PR #2539 (server-switch re-sync is intended → seed-once would be wrong;
+    // key-remount-by-server is the React-idiomatic follow-up, tracked).
+    // Verified config-driven: rule=error fails on pre-#2539 staging, passes after.
+    "react-doctor/no-derived-state-effect": "error",
+    // ── no-cascading-set-state + no-adjust-state-on-prop-change (YMNNE sister
+    // rules) promoted to error. The full 59-site inventory was cleared across
+    // PR #2542 (CreateAgentDialog) / #2545 (Cluster 2, 5 files) / #2546
+    // (Cluster 3 hot-path, 4 files) / #2547 (SettingsPanel) / #2548 (Cluster 5
+    // scatter, 11 files) — all documented FP families (async-loader / channel
+    // /entity-switch reset / animation-key bump / sync-with-external-store /
+    // form re-sync). Each cluster verified config-driven (base-FAIL/head-PASS);
+    // whole-tree = 0 hits at #2548 HEAD. The key-remount-by-server real-fix for
+    // SettingsPanel's server-switch re-sync is tracked as a separate follow-up.
+    "react-doctor/no-cascading-set-state": "error",
+    "react-doctor/no-adjust-state-on-prop-change": "error",
+    // YMNNE-family siblings gated 2026-06-09 (xxchan go): existing 63 sites grandfathered via inline oxlint-disable; rule blocks NEW violations. See docs/frontend/render-cost-contract.md.
+    "react-doctor/no-event-handler": "error",
+    "react-doctor/no-chain-state-updates": "error",
+    "react-doctor/no-initialize-state": "error",
+    "react-doctor/no-effect-chain": "error",
+
+    // ── Gate-now batch 4 (PR H): design-doctrine rules @Bugen greenlit as
+    // zero-controversy — align existing neo-brutal / CLAUDE.md doctrine.
+    "react-doctor/no-z-index-9999": "error",
+    "react-doctor/no-transition-all": "error",
+    "react-doctor/no-gradient-text": "error",
+
+    // ── Gate-now batch 3 (PR G): zero-violation a11y-correctness /
+    // correctness / effect-anti-pattern / module rules → error.
+    "react-doctor/tabindex-no-positive": "error",
+    "react-doctor/no-noninteractive-tabindex": "error",
+    "react-doctor/no-interactive-element-to-noninteractive-role": "error",
+    "react-doctor/no-noninteractive-element-to-interactive-role": "error",
+    "react-doctor/no-noninteractive-element-interactions": "error",
+    "react-doctor/mouse-events-have-key-events": "error",
+    "react-doctor/no-outline-none": "error",
+    "react-doctor/no-disabled-zoom": "error",
+    "react-doctor/effect-needs-cleanup": "error",
+    "react-doctor/no-uncontrolled-input": "error",
+    "react-doctor/style-prop-object": "error",
+    "react-doctor/prefer-use-sync-external-store": "error",
+    "react-doctor/no-flush-sync": "error",
+    "react-doctor/no-fetch-in-effect": "error",
+    "react-doctor/no-mirror-prop-effect": "error",
+    "react-doctor/no-prop-callback-in-effect": "error",
+    "react-doctor/no-event-trigger-state": "error",
+    "react-doctor/no-pass-live-state-to-parent": "error",
+    "react-doctor/no-effect-event-handler": "error",
+    "react-doctor/no-effect-event-in-deps": "error",
+    "react-doctor/no-dynamic-import-path": "error",
+
+    // ── Gate-now batch 2 (PR F): more already-zero-violation high-signal
+    // security / deprecated-React / correctness / bundle / a11y rules → error.
+    "react-doctor/no-eval": "error",
+    "react-doctor/no-secrets-in-client-code": "error",
+    "react-doctor/no-unsafe": "error",
+    "react-doctor/no-find-dom-node": "error",
+    "react-doctor/no-is-mounted": "error",
+    "react-doctor/no-legacy-class-lifecycles": "error",
+    "react-doctor/no-legacy-context-api": "error",
+    "react-doctor/no-react-dom-deprecated-apis": "error",
+    "react-doctor/no-redundant-should-component-update": "error",
+    "react-doctor/prefer-es6-class": "error",
+    "react-doctor/prefer-function-component": "error",
+    "react-doctor/no-default-props": "error",
+    "react-doctor/display-name": "error",
+    "react-doctor/require-render-return": "error",
+    "react-doctor/no-nested-component-definition": "error",
+    "react-doctor/no-mutating-reducer-state": "error",
+    "react-doctor/forward-ref-uses-ref": "error",
+    "react-doctor/jsx-no-comment-textnodes": "error",
+    "react-doctor/no-moment": "error",
+    "react-doctor/no-full-lodash-import": "error",
+    "react-doctor/alt-text": "error",
+    "react-doctor/anchor-has-content": "error",
+    "react-doctor/anchor-ambiguous-text": "error",
+    "react-doctor/heading-has-content": "error",
+    "react-doctor/img-redundant-alt": "error",
+    "react-doctor/lang": "error",
+    "react-doctor/no-aria-hidden-on-focusable": "error",
+    "react-doctor/aria-activedescendant-has-tabindex": "error",
+    "react-doctor/aria-unsupported-elements": "error",
+    "react-doctor/autocomplete-valid": "error",
+
+    // ── Gate-now batch (PR E): already-zero-violation high-signal
+    // correctness / security / a11y rules promoted to error to lock the
+    // clean state (oxlint all-warn recon 2026-06-02: each = 0 in src).
+    "react-doctor/no-danger": "error",
+    "react-doctor/no-danger-with-children": "error",
+    "react-doctor/jsx-no-script-url": "error",
+    "react-doctor/jsx-no-target-blank": "error",
+    "react-doctor/jsx-key": "error",
+    "react-doctor/jsx-no-duplicate-props": "error",
+    "react-doctor/jsx-no-undef": "error",
+    "react-doctor/no-children-prop": "error",
+    "react-doctor/no-clone-element": "error",
+    "react-doctor/no-direct-mutation-state": "error",
+    "react-doctor/no-direct-state-mutation": "error",
+    "react-doctor/no-render-return-value": "error",
+    "react-doctor/no-set-state-in-render": "error",
+    "react-doctor/no-string-refs": "error",
+    "react-doctor/no-this-in-sfc": "error",
+    "react-doctor/no-unknown-property": "error",
+    "react-doctor/no-unstable-nested-components": "error",
+    "react-doctor/void-dom-elements-no-children": "error",
+    "react-doctor/jsx-no-constructed-context-values": "error",
+    "react-doctor/jsx-no-new-array-as-prop": "error",
+    "react-doctor/jsx-no-new-function-as-prop": "error",
+    "react-doctor/jsx-no-new-object-as-prop": "error",
+    "react-doctor/no-did-mount-set-state": "error",
+    "react-doctor/no-will-update-set-state": "error",
+    "react-doctor/no-namespace": "error",
+    "react-doctor/aria-props": "error",
+    "react-doctor/aria-proptypes": "error",
+    "react-doctor/aria-role": "error",
+    "react-doctor/role-has-required-aria-props": "error",
+    "react-doctor/role-supports-aria-props": "error",
+    "react-doctor/html-has-lang": "error",
+    "react-doctor/iframe-has-title": "error",
+    "react-doctor/no-access-key": "error",
+    "react-doctor/no-distracting-elements": "error",
+
+    // ───────────────────────── Tier-1 (error) ─────────────────────────
+    // These four rules guard regressions for issues already fixed on
+    // staging. They are kept at "error" so a re-introduction trips CI
+    // (once the gate is turned on in a later PR).
+
+    // PR #2194 — iframes in AttachmentMessage / docs sandbox.
+    "react-doctor/iframe-missing-sandbox": "error",
+
+    // PR #2194 — passive scroll listeners on hot paths.
+    "react-doctor/client-passive-event-listeners": "error",
+
+    // PR #2197 — ActionCard's local useState(metadata) mirror removed;
+    // prop is now source of truth. This rule blocks regressing back to
+    // a derived-from-prop useState.
+    "react-doctor/no-derived-useState": "error",
+
+    // PR #2198 — App.tsx hoist + AgentScopesPanel rename fixed the
+    // existing rules-of-hooks violations. Keep the rule on at error
+    // severity so any new early-return-before-hooks lands as a CI fail.
+    "react-doctor/rules-of-hooks": "error",
+
+    // ───────────────────────── DROP (off) ─────────────────────────
+    // Rules explicitly disabled with rationale. Revisit when the
+    // anchor reason changes; do not flip without a thread decision.
+
+    // Conflicts with the canonical React rules-of-hooks contract
+    // (cannot reorder hooks across an early return). Marked no-fix by
+    // react-doctor maintainers in their own review notes; not worth
+    // the manual sweep cost for the false-positive shape we see in
+    // slock callsites.
+    // Anchor: PR #2197 review #proj-frontend:b204aff6.
+    "react-doctor/rerender-memo-before-early-return": "off",
+
+    // Fires on Vite/React Fast Refresh boundaries that mix component
+    // exports with hook / util exports. The rule is a dev-time HMR
+    // hygiene check, not a runtime concern; the production bundle is
+    // unaffected. Fixing it requires splitting many small modules,
+    // which we don't want to absorb during the lint bootstrap.
+    // Revisit: if we ever see actual HMR breakage trace to this.
+    "react-doctor/only-export-components": "off",
+
+    // Mechanical "add type=button to every <button>" sweep. ESLint
+    // fix-on-save (in editors that wire it) handles this for free,
+    // and the rule otherwise produces a large noisy batch that adds
+    // no real safety beyond what default-button-as-submit-form already
+    // gives us inside <form> elements (slock has very few).
+    // Revisit: when we add an autofix pipeline.
+    "react-doctor/button-has-type": "off",
+
+    // 8/8 false positives in slock — every hit was a react-router
+    // `useLocation()` reference, NOT `window.location`. The rule
+    // treats `Location` type-name matches as mutable globals; the
+    // hook return value is router-managed and stable across renders.
+    // Anchor: PR #2198 readback thread #proj-frontend:fbd35ac3.
+    "react-doctor/no-mutable-in-deps": "off"
+
+    // ───────────────────────── Future tiers ─────────────────────────
+    // The remaining ~283 react-doctor rules are not enabled in this
+    // bootstrap PR. They will be promoted as batched sweep PRs land
+    // (tracked under #proj-routine-inspection — methodology v0.3).
+    // The "parked baseline ~325 conditions" lives in the
+    // react-doctor CLI scanner output, not in oxlint findings yet.
+  },
+
+  "overrides": [
+    // RFC 037 pure-layer gate: the L2 event/reducer layer and the L3
+    // projection layer are plain TypeScript — no React, no transport, no
+    // zustand instance access. Structural pin for RFC 037 §3.1; the
+    // per-component-directory useEffect ratchet (§3.2) flips per slice.
+    {
+      "files": ["src/store/events/**/*.ts", "src/store/projections/**/*.ts"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "paths": [
+              { "name": "react", "message": "RFC 037: store/events + store/projections are hook-free pure layers." },
+              { "name": "react-dom", "message": "RFC 037: pure layer must not touch the DOM." },
+              { "name": "axios", "message": "RFC 037 I1: reducers/projections never perform I/O - transport lives in L1." },
+              { "name": "../../api/client", "message": "RFC 037 I1: reducers/projections never perform I/O - transport lives in L1." },
+              { "name": "../api/client", "message": "RFC 037 I1: reducers/projections never perform I/O - transport lives in L1." }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,189 @@
+{
+  "contract": "legacy-reaction-roster-v1-to-normalized-message-v2",
+  "schemaVersion": 5,
+  "cases": [
+    {
+      "name": "receiver-private-complete-snapshot-with-reaction",
+      "input": {
+        "serverId": "server-a",
+        "parentScopeKey": {
+          "serverId": "server-a",
+          "scopeKind": "channel",
+          "scopeId": "channel-a"
+        },
+        "messageId": "message-a",
+        "source": "receiver-private",
+        "viewerUserId": "actor-b",
+        "reactions": [
+          {
+            "emoji": "👍",
+            "count": 4,
+            "reactorIds": ["actor-d", "actor-b", "actor-a", "actor-c"],
+            "reactorNames": ["Dee", "Bee", "Ada", "Cee"]
+          }
+        ]
+      },
+      "expected": {
+        "sharedFact": [
+          {
+            "emoji": "👍",
+            "count": 4,
+            "previewK": []
+          }
+        ],
+        "viewerOverlay": {
+          "serverId": "server-a",
+          "messageId": "message-a",
+          "completeness": "complete",
+          "reactedEmojis": ["👍"]
+        },
+        "readCacheSeed": [
+          {
+            "parentScopeKey": {
+              "serverId": "server-a",
+              "scopeKind": "channel",
+              "scopeId": "channel-a"
+            },
+            "messageId": "message-a",
+            "emoji": "👍",
+            "actors": [
+              { "id": "actor-a", "displayName": "Ada" },
+              { "id": "actor-b", "displayName": "Bee" },
+              { "id": "actor-c", "displayName": "Cee" },
+              { "id": "actor-d", "displayName": "Dee" }
+            ],
+            "completeness": "complete"
+          }
+        ],
+        "violations": []
+      },
+      "canonicalFactJson": "[{\"emoji\":\"👍\",\"count\":4,\"previewK\":[]}]\n",
+      "canonicalFactSha256": "ecbec9c24b6578b1326a44a163c5c6fdd7b7be92b062e91c9a6308d2191307b6",
+      "viewerOverlayJson": "{\"serverId\":\"server-a\",\"messageId\":\"message-a\",\"completeness\":\"complete\",\"reactedEmojis\":[\"👍\"]}\n",
+      "viewerOverlaySha256": "dd0611de573c68539f0f7f8547ea2d68bf0b8ec042b120b5716dd3438aa23fb6"
+    },
+    {
+      "name": "receiver-private-empty-snapshot-clears-disappeared-reactions",
+      "input": {
+        "serverId": "server-a",
+        "parentScopeKey": {
+          "serverId": "server-a",
+          "scopeKind": "channel",
+          "scopeId": "channel-a"
+        },
+        "messageId": "message-a",
+        "source": "receiver-private",
+        "viewerUserId": "actor-b",
+        "reactions": []
+      },
+      "expected": {
+        "sharedFact": [],
+        "viewerOverlay": {
+          "serverId": "server-a",
+          "messageId": "message-a",
+          "completeness": "complete",
+          "reactedEmojis": []
+        },
+        "readCacheSeed": [],
+        "violations": []
+      },
+      "canonicalFactJson": "[]\n",
+      "canonicalFactSha256": "37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570",
+      "viewerOverlayJson": "{\"serverId\":\"server-a\",\"messageId\":\"message-a\",\"completeness\":\"complete\",\"reactedEmojis\":[]}\n",
+      "viewerOverlaySha256": "05e3fbbc8faf37221d6f266f0c75e5e16ab677470035d6ab23f9a934bc624901"
+    },
+    {
+      "name": "channel-room-overlay-remains-unknown",
+      "input": {
+        "serverId": "server-a",
+        "parentScopeKey": {
+          "serverId": "server-a",
+          "scopeKind": "channel",
+          "scopeId": "channel-a"
+        },
+        "messageId": "message-a",
+        "source": "channel-room",
+        "viewerUserId": "actor-b",
+        "reactions": [
+          {
+            "emoji": "👍",
+            "count": 4,
+            "reactorIds": ["actor-d", "actor-b", "actor-a", "actor-c"],
+            "reactorNames": ["Dee", "Bee", "Ada", "Cee"]
+          }
+        ]
+      },
+      "expected": {
+        "sharedFact": [
+          {
+            "emoji": "👍",
+            "count": 4,
+            "previewK": []
+          }
+        ],
+        "viewerOverlay": null,
+        "readCacheSeed": [
+          {
+            "parentScopeKey": {
+              "serverId": "server-a",
+              "scopeKind": "channel",
+              "scopeId": "channel-a"
+            },
+            "messageId": "message-a",
+            "emoji": "👍",
+            "actors": [
+              { "id": "actor-a", "displayName": "Ada" },
+              { "id": "actor-b", "displayName": "Bee" },
+              { "id": "actor-c", "displayName": "Cee" },
+              { "id": "actor-d", "displayName": "Dee" }
+            ],
+            "completeness": "complete"
+          }
+        ],
+        "violations": []
+      },
+      "canonicalFactJson": "[{\"emoji\":\"👍\",\"count\":4,\"previewK\":[]}]\n",
+      "canonicalFactSha256": "ecbec9c24b6578b1326a44a163c5c6fdd7b7be92b062e91c9a6308d2191307b6",
+      "viewerOverlayJson": "null\n",
+      "viewerOverlaySha256": "38e0b9de817f645c4bec37c0d4a3e58baecccb040f5718dc069a72c7385a0bed"
+    },
+    {
+      "name": "malformed-roster-keeps-viewer-overlay-unknown",
+      "input": {
+        "serverId": "server-a",
+        "parentScopeKey": {
+          "serverId": "server-a",
+          "scopeKind": "channel",
+          "scopeId": "channel-a"
+        },
+        "messageId": "message-a",
+        "source": "receiver-private",
+        "viewerUserId": "actor-b",
+        "reactions": [
+          {
+            "emoji": "👍",
+            "count": 2,
+            "reactorIds": ["actor-a", "actor-a", ""],
+            "reactorNames": ["Ada", "Conflicting Ada", "Nobody"]
+          }
+        ]
+      },
+      "expected": {
+        "sharedFact": [
+          { "emoji": "👍", "count": 2, "previewK": [] }
+        ],
+        "viewerOverlay": null,
+        "readCacheSeed": [],
+        "violations": [
+          { "kind": "duplicate_actor_id", "emoji": "👍" },
+          { "kind": "empty_actor_id", "emoji": "👍" },
+          { "kind": "actor_count_mismatch", "emoji": "👍" }
+        ]
+      },
+      "canonicalFactJson": "[{\"emoji\":\"👍\",\"count\":2,\"previewK\":[]}]\n",
+      "canonicalFactSha256": "dcbe44180845e73c6406e3c23c2d3ae83f390682ca2f1045744feafa4df13aa8",
+      "viewerOverlayJson": "null\n",
+      "viewerOverlaySha256": "38e0b9de817f645c4bec37c0d4a3e58baecccb040f5718dc069a72c7385a0bed"
+    }
+  ]
+}

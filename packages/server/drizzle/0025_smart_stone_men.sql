@@ -1,0 +1,1 @@
+ALTER TABLE "daemons" DROP COLUMN "status";

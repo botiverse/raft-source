@@ -1,0 +1,44 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "DesktopManifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "manifestVersion",
+    "frontendReleaseId",
+    "frontendCommitSha",
+    "compatibility",
+    "updateRecommendation"
+  ],
+  "properties": {
+    "manifestVersion": { "const": 1 },
+    "frontendReleaseId": { "type": "string", "minLength": 1 },
+    "frontendCommitSha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "compatibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["appSemver", "protocolMin", "protocolMax", "requiredCapabilities"],
+      "properties": {
+        "appSemver": {
+          "type": "string",
+          "pattern": "^(?:(?:>=|<=|>|<|=|\\^|~)?(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*))(?:, *(?:>=|<=|>|<|=|\\^|~)?(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*))*$"
+        },
+        "protocolMin": { "type": "integer", "minimum": 1 },
+        "protocolMax": { "type": "integer", "minimum": 1 },
+        "requiredCapabilities": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 0,
+          "uniqueItems": true
+        }
+      }
+    },
+    "updateRecommendation": {
+      "type": "string",
+      "enum": ["current", "recommended", "none"]
+    }
+  }
+}

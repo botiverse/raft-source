@@ -1,0 +1,60 @@
+# Canonical product identity (decided by @WAWQAQ 2026-09-08).
+appId: build.raft.desktop
+productName: Raft Desktop
+# Space-free artifact names, always arch-suffixed. Two reasons:
+#  * The productName "Raft Desktop" has a space; GitHub sanitizes spaces in
+#    release-asset names, so electron-updater rewrites the space to a hyphen in
+#    latest-mac.yml's `url`. A hyphenated literal here keeps the on-disk file,
+#    the manifest url, and the uploaded GitHub asset name all identical — no
+#    space-sanitization mismatch that would 404 the auto-update download.
+#  * Without an explicit ${arch}, electron-builder leaves the x64 DMG
+#    un-suffixed, but the per-arch sign+notarize verify job looks for "*-x64.dmg".
+artifactName: Raft-Desktop-${version}-${arch}.${ext}
+directories:
+  output: release
+  buildResources: build
+files:
+  - dist/**
+  - package.json
+  - "!**/*.map"
+# The bundled `raft` CLI the detached __run daemon child hands to each agent
+# runtime as slockCliPath (RAFT_COMPUTER_CLI_PATH → <resources>/cli/index.js).
+extraResources:
+  - from: ../../packages/cli/dist/index.js
+    to: cli/index.js
+protocols:
+  - name: Raft
+    schemes:
+      - raft
+mac:
+  category: public.app-category.productivity
+  icon: build/icon.icns
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  target:
+    # dmg for distribution, zip for electron-updater's differential feed.
+    # Per-arch (arm64 + x64) so one release covers Apple Silicon AND Intel Macs,
+    # matching raft-computer-app and the shared sign+notarize workflow's per-arch
+    # mode (which verifies both architectures).
+    - target: dmg
+      arch:
+        - x64
+        - arm64
+    - target: zip
+      arch:
+        - x64
+        - arm64
+dmg:
+  sign: false
+# Update feed (decided by @WAWQAQ 2026-09-09): the public botiverse/desktop-beta
+# repo is where signed releases + the electron-updater manifest (latest-mac.yml)
+# live, so people can download AND installed apps can auto-update from the same
+# place. This bakes app-update.yml into the app pointing here; a public repo needs
+# no token to read the releases feed. Inert until 0.1.1 (the first version whose
+# build carries this config) is published to desktop-beta.
+publish:
+  - provider: github
+    owner: botiverse
+    repo: desktop-beta

@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+# raftdev — Raft dev environment CLI. Thin wrapper that boots the pinned Node
+# and execs scripts/dev/raftdev.ts. SLOCKDEV_* env names and the .slockdev
+# state directory keep their legacy names for compatibility.
+set -u
+
+project_dir="$(cd "$(dirname "$0")" && pwd)"
+node_pin="$(tr -d '[:space:]' < "$project_dir/.node-version")"
+pin_major="${node_pin%%.*}"
+engine_range="$(awk '
+  /"engines"[[:space:]]*:/ { in_engines = 1; next }
+  in_engines && /"node"[[:space:]]*:/ {
+    value = $0
+    sub(/^[^:]*:[[:space:]]*"/, "", value)
+    sub(/".*/, "", value)
+    print value
+    exit
+  }
+  in_engines && /}/ { exit }
+' "$project_dir/package.json")"
+
+# Accept a >=MAJOR floor with an optional .MINOR[.PATCH] tail (">=24" and
+# ">=24.0.0" are the same contract). The floor is compared as a full normalized
+# triplet, not by major alone: with pin 24.15.0 a floor of >=24.16.0 or
+# >=24.15.1 is NEWER than the pin and must be refused. Anything else stays
+# unparsed so the check below fails closed rather than guessing.
+if [[ "$engine_range" =~ ^\>\=([0-9]+)(\.([0-9]+))?(\.([0-9]+))?$ ]]; then
+  required_major="${BASH_REMATCH[1]}"
+  required_minor="${BASH_REMATCH[3]:-0}"
+  required_patch="${BASH_REMATCH[5]:-0}"
+else
+  required_major=""
+  required_minor=""
+  required_patch=""
+fi
+
+# The pin must be a complete, well-formed triplet with no extra segments; a
+# malformed pin fails the contract closed rather than being partially parsed.
+if [[ "$node_pin" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+  pin_major="${BASH_REMATCH[1]}"
+  pin_minor="${BASH_REMATCH[2]}"
+  pin_patch="${BASH_REMATCH[3]}"
+else
+  pin_major=""
+  pin_minor=""
+  pin_patch=""
+fi
+
+contract_ok=1
+if [ -z "$pin_major" ] || [ -z "$required_major" ]; then
+  contract_ok=0
+else
+  # floor must be <= pin, compared major.minor.patch in order
+  if [ "$required_major" -gt "$pin_major" ]; then contract_ok=0
+  elif [ "$required_major" -eq "$pin_major" ]; then
+    if [ "$required_minor" -gt "$pin_minor" ]; then contract_ok=0
+    elif [ "$required_minor" -eq "$pin_minor" ] && [ "$required_patch" -gt "$pin_patch" ]; then contract_ok=0
+    fi
+  fi
+fi
+
+if [ "$contract_ok" -eq 0 ]; then
+  printf 'ERROR: raftdev Node contract is inconsistent (.node-version=%s, package engines.node=%s).\n' \
+    "$node_pin" "${engine_range:-missing}" >&2
+  printf 'Next action: use a >=major[.minor[.patch]] engine floor no newer than the repository pin.\n' >&2
+  exit 1
+fi
+
+if ! command -v node >/dev/null 2>&1; then
+  printf 'ERROR: raftdev requires Node >=%s, but node is not available on PATH.\n' "${required_major}.${required_minor}.${required_patch}" >&2
+  printf 'Next action: install/activate Node %s (the repository pin), then retry.\n' "$node_pin" >&2
+  exit 1
+fi
+
+node_version="$(node --version 2>/dev/null || true)"
+# The active runtime is compared as a full triplet, matching the floor syntax
+# this contract advertises. Comparing majors alone would let v24.14.9 satisfy a
+# >=24.15.0 floor — the same defect as comparing floor to pin by major.
+# Strict triplet, anchored at both ends. Without the trailing anchor,
+# "v24.15.0garbage" and "v24.15.0.1" parse as a valid 24.15.0. Prerelease and
+# build metadata are deliberately NOT accepted: honouring them would require
+# defining and testing semver ordering, which this contract does not do.
+if [[ "$node_version" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+  current_major="${BASH_REMATCH[1]}"
+  current_minor="${BASH_REMATCH[2]}"
+  current_patch="${BASH_REMATCH[3]}"
+else
+  printf 'ERROR: raftdev could not parse the active Node version: %s\n' "${node_version:-<empty>}" >&2
+  printf 'Next action: install/activate Node %s (the repository pin), then retry.\n' "$node_pin" >&2
+  exit 1
+fi
+
+node_too_old=0
+if [ "$current_major" -lt "$required_major" ]; then node_too_old=1
+elif [ "$current_major" -eq "$required_major" ]; then
+  if [ "$current_minor" -lt "$required_minor" ]; then node_too_old=1
+  elif [ "$current_minor" -eq "$required_minor" ] && [ "$current_patch" -lt "$required_patch" ]; then node_too_old=1
+  fi
+fi
+
+if [ "$node_too_old" -eq 1 ]; then
+  printf 'ERROR: Node %s is unsupported; raftdev requires Node >=%s before starting local services.\n' \
+    "$node_version" "${required_major}.${required_minor}.${required_patch}" >&2
+  printf 'No containers or local processes were started.\n' >&2
+  printf 'Next action: Install/activate Node %s (the repository pin), then retry.\n' "$node_pin" >&2
+  exit 1
+fi
+
+# Only `start` needs the signal/cleanup process-group boundary below. Keep
+# interactive commands such as `logs` attached to the foreground terminal.
+if [ "${1:-}" != "start" ]; then
+  exec node --import tsx "$project_dir/scripts/dev/raftdev.ts" "$@"
+fi
+
+intent_file="$(mktemp "${TMPDIR:-/tmp}/raftdev-start.XXXXXX")"
+rm -f "$intent_file"
+child_pid=""
+
+cleanup_armed_start() {
+  local cleanup_name=""
+  local seed_existed="0"
+  local legacy_base_owned="0"
+  local legacy_risingwave_owned="0"
+  local legacy_risingwave_network_owned="0"
+  local tunnel_pid="0"
+
+  if [ ! -s "$intent_file" ] || [ -e "$intent_file.cleaned" ]; then
+    return
+  fi
+  IFS=$'\t' read -r cleanup_name seed_existed legacy_base_owned \
+    legacy_risingwave_owned legacy_risingwave_network_owned tunnel_pid < "$intent_file" || true
+  if [ -z "$cleanup_name" ]; then
+    return
+  fi
+  RAFTDEV_START_INTENT_FILE="" node --import tsx \
+    "$project_dir/scripts/dev/raftdev.ts" __cleanup-failed-start "$cleanup_name" \
+    "$seed_existed" "$legacy_base_owned" "$legacy_risingwave_owned" \
+    "$legacy_risingwave_network_owned" "$tunnel_pid" || true
+}
+
+forward_signal() {
+  local signal="$1"
+  local status="$2"
+  trap '' HUP INT TERM
+
+  if [ -n "$child_pid" ]; then
+    kill "-$signal" -- "-$child_pid" 2>/dev/null || kill "-$signal" "$child_pid" 2>/dev/null || true
+    for _ in {1..20}; do
+      kill -0 "$child_pid" 2>/dev/null || break
+      sleep 0.05
+    done
+    if kill -0 "$child_pid" 2>/dev/null; then
+      kill -KILL -- "-$child_pid" 2>/dev/null || kill -KILL "$child_pid" 2>/dev/null || true
+    fi
+    wait "$child_pid" 2>/dev/null || true
+  fi
+
+  cleanup_armed_start
+  rm -f "$intent_file" "$intent_file.cleaned"
+  exit "$status"
+}
+
+# Backgrounding the implementation in its own process group lets the wrapper
+# interrupt a blocked spawnSync child and still run cleanup before returning.
+set -m
+trap 'forward_signal HUP 129' HUP
+trap 'forward_signal INT 130' INT
+trap 'forward_signal TERM 143' TERM
+RAFTDEV_START_INTENT_FILE="$intent_file" node --import tsx "$project_dir/scripts/dev/raftdev.ts" "$@" &
+child_pid=$!
+wait "$child_pid"
+status=$?
+if [ "$status" -ne 0 ]; then
+  trap '' HUP INT TERM
+  cleanup_armed_start
+else
+  trap - HUP INT TERM
+fi
+rm -f "$intent_file" "$intent_file.cleaned"
+exit "$status"

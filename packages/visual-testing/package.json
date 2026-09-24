@@ -1,0 +1,47 @@
+{
+  "name": "@botiverse/raft-visual-testing",
+  "version": "0.1.0",
+  "license": "FSL-1.1-ALv2",
+  "description": "Slock cross-provider visual testing CLI and shared case manifest.",
+  "type": "module",
+  "exports": {
+    "./cli": "./src/cli.mjs",
+    "./sharedCases": "./shared/sharedCases.json",
+    "./sharedTokens": "./shared/sharedTokens.json",
+    "./tokenAuditColorClassifications": "./shared/tokenAuditColorClassifications.json",
+    "./fixtureData": "./shared/fixtureData.json"
+  },
+  "bin": {
+    "slock-visual": "./src/cli.mjs",
+    "slock-visual-testing": "./src/cli.mjs"
+  },
+  "scripts": {
+    "scan": "node src/cli.mjs scan",
+    "validate": "node src/cli.mjs validate",
+    "capture:react": "node src/cli.mjs capture --providers react",
+    "diff": "node src/cli.mjs diff",
+    "report": "node src/cli.mjs report",
+    "site": "node src/cli.mjs site",
+    "publish": "node src/cli.mjs publish-gh-pages"
+  },
+  "files": [
+    "README.md",
+    "src",
+    "site",
+    "shared",
+    "tests"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "0.84.4",
+    "sharp": "^0.34.5"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.59.1"
+  }
+}

@@ -1,0 +1,45 @@
+[
+  {
+    "id": "thumbs_up",
+    "emoji": "👍",
+    "label": "Thumbs up",
+    "source": "thumbs_up.svg"
+  },
+  {
+    "id": "heart",
+    "emoji": "❤️",
+    "aliases": ["❤"],
+    "label": "Heart",
+    "source": "heart.svg"
+  },
+  {
+    "id": "party_popper",
+    "emoji": "🎉",
+    "label": "Party popper",
+    "source": "party_popper.svg"
+  },
+  {
+    "id": "eyes",
+    "emoji": "👀",
+    "label": "Eyes",
+    "source": "eyes.svg"
+  },
+  {
+    "id": "fire",
+    "emoji": "🔥",
+    "label": "Fire",
+    "source": "fire.svg"
+  },
+  {
+    "id": "joy",
+    "emoji": "😂",
+    "label": "Face with tears of joy",
+    "source": "joy.svg"
+  },
+  {
+    "id": "check_mark",
+    "emoji": "✅",
+    "label": "Check mark",
+    "source": "check_mark.svg"
+  }
+]

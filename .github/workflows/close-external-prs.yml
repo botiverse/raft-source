@@ -1,0 +1,35 @@
+# Raft's public repository is a release mirror and does not accept pull
+# requests (see CONTRIBUTING.md). This workflow closes external pull requests
+# with an explanation. It ships with the source-available snapshot; in the
+# private development repository it never triggers because it only acts on
+# repositories named `raft-source`.
+name: Close external pull requests
+
+on:
+  pull_request_target:
+    types: [opened, reopened]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  close:
+    if: github.event.repository.name == 'raft-source'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const number = context.payload.pull_request.number;
+            await github.rest.issues.createComment({
+              owner, repo, issue_number: number,
+              body: [
+                "Thanks for your interest in Raft.",
+                "",
+                "This repository is a source-available release mirror and does not accept pull requests at this time,",
+                "so this PR is being closed automatically. See CONTRIBUTING.md for details and SECURITY.md for",
+                "how to report security issues privately.",
+              ].join("\n"),
+            });
+            await github.rest.pulls.update({ owner, repo, pull_number: number, state: "closed" });

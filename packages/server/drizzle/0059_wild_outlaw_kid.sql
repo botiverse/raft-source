@@ -1,0 +1,1 @@
+ALTER TABLE "server_members" ADD COLUMN "sidebar_pinned_sort_mode" text DEFAULT 'manual' NOT NULL;

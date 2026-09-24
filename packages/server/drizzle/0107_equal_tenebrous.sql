@@ -1,0 +1,1 @@
+ALTER TABLE "oauth_clients" ADD COLUMN "human_marketplace_visible" boolean DEFAULT true NOT NULL;

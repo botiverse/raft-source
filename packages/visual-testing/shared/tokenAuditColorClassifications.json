@@ -1,0 +1,237 @@
+{
+  "version": 1,
+  "unknownColors": {
+    "react": [
+      {
+        "file": "packages/web/src/components/auth/LoginPage.tsx",
+        "value": "#EA4335",
+        "category": "brand-asset",
+        "reason": "Google logo red channel; keep outside Slock palette."
+      },
+      {
+        "file": "packages/web/src/components/auth/LoginPage.tsx",
+        "value": "#34A853",
+        "category": "brand-asset",
+        "reason": "Google logo green channel; keep outside Slock palette."
+      },
+      {
+        "file": "packages/web/src/components/auth/LoginPage.tsx",
+        "value": "#4285F4",
+        "category": "brand-asset",
+        "reason": "Google logo blue channel; keep outside Slock palette."
+      },
+      {
+        "file": "packages/web/src/components/auth/LoginPage.tsx",
+        "value": "#FBBC05",
+        "category": "brand-asset",
+        "reason": "Google logo yellow channel; keep outside Slock palette."
+      },
+      {
+        "file": "packages/web/src/components/settings/SettingsPanel.tsx",
+        "value": "#EA4335",
+        "category": "brand-asset",
+        "reason": "Google logo red channel; keep outside Slock palette."
+      },
+      {
+        "file": "packages/web/src/components/settings/SettingsPanel.tsx",
+        "value": "#34A853",
+        "category": "brand-asset",
+        "reason": "Google logo green channel; keep outside Slock palette."
+      },
+      {
+        "file": "packages/web/src/components/settings/SettingsPanel.tsx",
+        "value": "#4285F4",
+        "category": "brand-asset",
+        "reason": "Google logo blue channel; keep outside Slock palette."
+      },
+      {
+        "file": "packages/web/src/components/settings/SettingsPanel.tsx",
+        "value": "#FBBC05",
+        "category": "brand-asset",
+        "reason": "Google logo yellow channel; keep outside Slock palette."
+      },
+      {
+        "file": "packages/web/src/components/message/MessageItem.tsx",
+        "value": "#FFF8E7",
+        "category": "illustration-highlight",
+        "reason": "Reaction glyph highlight color, not a reusable UI surface token yet."
+      },
+      {
+        "file": "packages/web/src/components/message/MessageItem.tsx",
+        "value": "#8FC4D9",
+        "category": "illustration-highlight",
+        "reason": "Reaction glyph accent color, not a reusable UI surface token yet."
+      },
+      {
+        "file": "packages/web/src/components/message/MessageItem.tsx",
+        "value": "#1F883D",
+        "category": "diff-semantic",
+        "reason": "GitHub-style insertion semantic color in diff rendering."
+      },
+      {
+        "file": "packages/web/src/components/message/MessageItem.tsx",
+        "value": "#CF222E",
+        "category": "diff-semantic",
+        "reason": "GitHub-style deletion semantic color in diff rendering."
+      },
+      {
+        "file": "packages/web/src/components/message/MessageItem.tsx",
+        "value": "#EEEDE6",
+        "category": "thread-reaction-surface",
+        "reason": "Muted reaction chip surface pending promotion to a named shared token."
+      },
+      {
+        "file": "packages/web/src/components/message/MessageItem.tsx",
+        "value": "#E0DED4",
+        "category": "thread-reaction-surface",
+        "reason": "Muted reaction chip border pending promotion to a named shared token."
+      },
+      {
+        "file": "packages/web/src/components/search/MessageSearchPage.tsx",
+        "value": "#FFF4BF",
+        "category": "search-highlight",
+        "reason": "Search match highlight surface; should be promoted only after KMP parity review."
+      },
+      {
+        "file": "packages/web/src/components/search/MessageSearchPage.tsx",
+        "value": "#FF7AD9",
+        "category": "search-highlight",
+        "reason": "Search entity accent; should be promoted only after KMP parity review."
+      },
+      {
+        "file": "packages/web/src/components/search/MessageSearchPage.tsx",
+        "value": "#FFEEFB",
+        "category": "search-highlight",
+        "reason": "Search entity pale accent; should be promoted only after KMP parity review."
+      },
+      {
+        "file": "packages/web/src/components/settings/MemberGraphSection.tsx",
+        "value": "#F8F8F0",
+        "category": "graph-surface",
+        "reason": "Member graph canvas surface pending component-specific token decision."
+      },
+      {
+        "file": "packages/web/src/components/settings/SettingsPanel.tsx",
+        "value": "#F7F7F5",
+        "category": "settings-legacy-surface",
+        "reason": "Legacy settings surface color pending shared token migration."
+      },
+      {
+        "file": "packages/web/src/components/settings/SettingsPanel.tsx",
+        "value": "#F8F8F0",
+        "category": "settings-legacy-surface",
+        "reason": "Legacy settings panel surface color pending shared token migration."
+      }
+    ],
+    "kmp": [
+      {
+        "file": "compose/shared/src/commonMain/kotlin/ai/slock/compose/BasicWidget.kt",
+        "value": "#333333",
+        "category": "legacy-widget-default",
+        "reason": "Kuikly demo/basic widget fallback pending token API migration."
+      },
+      {
+        "file": "compose/shared/src/commonMain/kotlin/ai/slock/compose/RouterPage.kt",
+        "value": "#7B7FE4",
+        "category": "demo-route-chrome",
+        "reason": "Kuikly router demo chrome, not product surface."
+      },
+      {
+        "file": "compose/shared/src/commonMain/kotlin/ai/slock/compose/RouterPage.kt",
+        "value": "#A65CF9",
+        "category": "demo-route-chrome",
+        "reason": "Kuikly router demo chrome, not product surface."
+      },
+      {
+        "file": "compose/shared/src/commonMain/kotlin/ai/slock/compose/RouterPage.kt",
+        "value": "#23D3FD",
+        "category": "demo-route-chrome",
+        "reason": "Kuikly router demo placeholder color, not product surface."
+      },
+      {
+        "file": "compose/shared/src/commonMain/kotlin/ai/slock/compose/SlockHomeComponents.kt",
+        "value": "#576574",
+        "category": "pixel-avatar-palette",
+        "reason": "Generated pixel avatar palette color pending dedicated avatar-token decision."
+      },
+      {
+        "file": "compose/shared/src/commonMain/kotlin/ai/slock/compose/SlockHomeComponents.kt",
+        "value": "#9DCAAA",
+        "category": "pixel-avatar-palette",
+        "reason": "Generated pixel avatar palette color pending dedicated avatar-token decision."
+      },
+      {
+        "file": "compose/shared/src/commonMain/kotlin/ai/slock/compose/SlockHomeComponents.kt",
+        "value": "#1E1E1C",
+        "category": "pixel-avatar-seed",
+        "reason": "Pixel avatar deterministic seed color, not a reusable UI surface token."
+      },
+      {
+        "file": "compose/shared/src/commonMain/kotlin/ai/slock/compose/SlockModalComponents.kt",
+        "value": "#FFF2F2",
+        "category": "modal-danger-surface",
+        "reason": "Danger selected surface pending shared danger-surface token decision."
+      },
+      {
+        "file": "compose/shared/src/commonMain/kotlin/ai/slock/compose/ThreadPage.kt",
+        "value": "#EEEDE6",
+        "category": "thread-reaction-surface",
+        "reason": "Muted reaction chip surface pending promotion to a named shared token."
+      },
+      {
+        "file": "compose/shared/src/commonMain/kotlin/ai/slock/compose/ThreadPage.kt",
+        "value": "#FFF8E7",
+        "category": "illustration-highlight",
+        "reason": "Reaction glyph highlight color, not a reusable UI surface token yet."
+      },
+      {
+        "file": "compose/shared/src/commonMain/kotlin/ai/slock/compose/ThreadPage.kt",
+        "value": "#8FC4D9",
+        "category": "illustration-highlight",
+        "reason": "Reaction glyph accent color, not a reusable UI surface token yet."
+      },
+      {
+        "file": "compose/shared/src/commonMain/kotlin/ai/slock/compose/ThreadPage.kt",
+        "value": "#576574",
+        "category": "pixel-avatar-palette",
+        "reason": "Generated pixel avatar palette color pending dedicated avatar-token decision."
+      },
+      {
+        "file": "compose/shared/src/commonMain/kotlin/ai/slock/compose/ThreadPage.kt",
+        "value": "#9DCAAA",
+        "category": "pixel-avatar-palette",
+        "reason": "Generated pixel avatar palette color pending dedicated avatar-token decision."
+      },
+      {
+        "file": "compose/shared/src/commonMain/kotlin/ai/slock/compose/ThreadPage.kt",
+        "value": "#1E1E1C",
+        "category": "pixel-avatar-seed",
+        "reason": "Pixel avatar deterministic seed color, not a reusable UI surface token."
+      },
+      {
+        "file": "compose/shared/src/commonMain/kotlin/ai/slock/compose/markdown/SlockMarkdown.kt",
+        "value": "#1D4ED8",
+        "category": "markdown-semantic",
+        "reason": "Markdown link blue pending shared semantic markdown token decision."
+      },
+      {
+        "file": "compose/shared/src/commonMain/kotlin/ai/slock/compose/markdown/SlockMarkdown.kt",
+        "value": "#111827",
+        "category": "markdown-semantic",
+        "reason": "Markdown code block surface pending shared semantic markdown token decision."
+      }
+    ]
+  },
+  "gate": {
+    "usageBudget": {
+      "react": {
+        "maxKnownTokenHardcoded": 0,
+        "maxUnclassifiedUnknownHardcoded": 0
+      },
+      "kmp": {
+        "maxKnownTokenHardcoded": 64,
+        "maxUnclassifiedUnknownHardcoded": 0
+      }
+    }
+  }
+}

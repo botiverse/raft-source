@@ -1,0 +1,42 @@
+{
+  "name": "@botiverse/raft-feature-flag-admin",
+  "version": "0.1.0",
+  "license": "FSL-1.1-ALv2",
+  "private": true,
+  "type": "module",
+  "main": "src/worker.ts",
+  "scripts": {
+    "build": "tsc --noEmit && vite build",
+    "check:operator-client-lifetime": "node scripts/check-operator-client-lifetime.mjs",
+    "check:staging-deploy-contract": "node --test scripts/render-staging-wrangler.test.mjs scripts/staging-deploy-contract.test.mjs scripts/verify-staging-deployment.test.mjs",
+    "dev": "vite --host 0.0.0.0",
+    "preview": "vite preview",
+    "deploy:dry-run": "pnpm run build && wrangler deploy --dry-run",
+    "test": "node --import tsx --test 'src/**/*.test.ts' 'scripts/**/*.test.mjs'",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@botiverse/raft-shared": "workspace:*",
+    "lucide-react": "^0.575.0",
+    "pg": "^8.20.0",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "4.20260601.1",
+    "@types/pg": "^8.20.0",
+    "@tailwindcss/postcss": "^4.2.2",
+    "@types/node": "^25.5.0",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.1.4",
+    "postcss": "^8.5.8",
+    "tailwindcss": "^4.2.2",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.1",
+    "wrangler": "^4.50.0"
+  }
+}

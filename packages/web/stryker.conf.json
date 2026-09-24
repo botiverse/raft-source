@@ -1,0 +1,11 @@
+{
+  "$schema": "https://raw.githubusercontent.com/stryker-mutator/stryker-js/master/packages/api/schema/stryker-core.json",
+  "testRunner": "command",
+  "commandRunner": {
+    "command": "node scripts/run-vitest-tests.mjs 'tests/**/*.test.ts'"
+  },
+  "coverageAnalysis": "off",
+  "inPlace": true,
+  "reporters": ["clear-text", "html"],
+  "timeoutMS": 60000
+}

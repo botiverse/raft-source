@@ -1,0 +1,1 @@
+ALTER TABLE "oauth_client_maintainers" ADD COLUMN "assigned_by_authority" text;

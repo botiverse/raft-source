@@ -1,0 +1,117 @@
+{
+  "$comment": [
+    "DRAFT neutral fixture for the replies/commentRef sync-core runtime fold.",
+    "This file intentionally has no recorded checksum yet: HanXin M2 must ack the schema",
+    "before Web or KMP freeze canonical bytes. Until then it is a schema seam, not a byte gate.",
+    "",
+    "Boundary: commentRef is a message canonical field with shared-null-preserve merge policy.",
+    "The replies window/scope is a MessageRepliesDiscussion + SyncScopeWindow read model.",
+    "Do not merge them into one cache shape just because both appear next to inline replies in the UI.",
+    "",
+    "historyLimited belongs to snapshot/cutoff authority only. Live frames must not set or clear",
+    "it, and true -> false must be reachable after a later authoritative snapshot."
+  ],
+  "contract": "message-replies-discussion-graph-v0-draft",
+  "schemaVersion": 0,
+  "canonicalBytesFrozen": false,
+  "cases": [
+    {
+      "name": "message_comment_ref_is_separate_from_replies_window",
+      "discussion": {
+        "root": {
+          "kind": "message",
+          "serverId": "server-1",
+          "id": "message-parent-1"
+        },
+        "relation": { "kind": "replies" },
+        "parentScopeKey": {
+          "serverId": "server-1",
+          "scopeKind": "channel",
+          "scopeId": "channel-1"
+        },
+        "backing": "sync-scope"
+      },
+      "window": {
+        "kind": "sync-scope-window",
+        "scopeCursor": null,
+        "epoch": "epoch-1"
+      },
+      "receiverPartition": {
+        "principalId": "user-1"
+      },
+      "messageProjection": {
+        "id": "message-parent-1",
+        "commentRef": {
+          "anchorLabel": "line 12",
+          "anchorQuote": "selected copy",
+          "attachmentId": "attachment-1",
+          "filename": "design.png",
+          "hostMessageId": "message-host-1",
+          "hostSource": {
+            "type": "message",
+            "routeKind": "channel",
+            "channelId": "channel-1"
+          }
+        }
+      },
+      "replyWindow": {
+        "historyLimited": false,
+        "replyCount": 2,
+        "replies": [
+          { "messageId": "reply-1", "seq": 11 },
+          { "messageId": "reply-2", "seq": 12 }
+        ]
+      }
+    },
+    {
+      "name": "history_limited_can_clear_on_later_snapshot",
+      "discussion": {
+        "root": {
+          "kind": "message",
+          "serverId": "server-1",
+          "id": "message-parent-2"
+        },
+        "relation": { "kind": "replies" },
+        "parentScopeKey": {
+          "serverId": "server-1",
+          "scopeKind": "channel",
+          "scopeId": "channel-1"
+        },
+        "backing": "sync-scope"
+      },
+      "window": {
+        "kind": "sync-scope-window",
+        "scopeCursor": "cursor-1",
+        "epoch": "epoch-2"
+      },
+      "receiverPartition": {
+        "principalId": "user-1"
+      },
+      "messageProjection": {
+        "id": "message-parent-2",
+        "commentRef": null
+      },
+      "replyWindow": {
+        "historyLimited": true,
+        "replyCount": 1,
+        "replies": [
+          { "messageId": "reply-3", "seq": 21 }
+        ]
+      },
+      "nextSnapshot": {
+        "window": {
+          "kind": "sync-scope-window",
+          "scopeCursor": null,
+          "epoch": "epoch-3"
+        },
+        "replyWindow": {
+          "historyLimited": false,
+          "replyCount": 1,
+          "replies": [
+            { "messageId": "reply-3", "seq": 21 }
+          ]
+        }
+      }
+    }
+  ]
+}

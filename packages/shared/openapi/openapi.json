@@ -1,0 +1,938 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Raft API",
+    "version": "0.1.0",
+    "description": "Generated Raft API contract. The current P1 registry contains the additive, unmounted attachment-upload pilot."
+  },
+  "servers": [
+    {
+      "url": "/",
+      "description": "The Raft server origin selected by the authenticated client."
+    }
+  ],
+  "tags": [
+    {
+      "name": "Attachment uploads",
+      "description": "Create, verify, cancel, and inspect direct attachment upload sessions."
+    }
+  ],
+  "paths": {
+    "/api/attachments/upload-capabilities": {
+      "get": {
+        "operationId": "getAttachmentUploadCapabilities",
+        "summary": "Get server-authoritative attachment upload limits",
+        "tags": [
+          "Attachment uploads"
+        ],
+        "security": [
+          {
+            "bearerAuth": [],
+            "serverScope": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current upload capability",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AttachmentUploadCapabilities"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/attachments/upload-sessions": {
+      "post": {
+        "operationId": "createAttachmentUploadSession",
+        "summary": "Create a direct attachment upload session",
+        "tags": [
+          "Attachment uploads"
+        ],
+        "security": [
+          {
+            "bearerAuth": [],
+            "serverScope": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateAttachmentUploadSessionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Upload session created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateAttachmentUploadSessionResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid upload request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidUploadRequestError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Upload is forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AttachmentUploadForbiddenError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Idempotency key conflicts with another request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AttachmentUploadIdempotencyConflictError"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Attachment is larger than the plan limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AttachmentUploadTooLargeError"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Upload creation is rate limited",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AttachmentUploadRateLimitedError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/attachments/upload-sessions/{uploadId}/complete": {
+      "post": {
+        "operationId": "completeAttachmentUploadSession",
+        "summary": "Verify and complete a direct attachment upload",
+        "tags": [
+          "Attachment uploads"
+        ],
+        "security": [
+          {
+            "bearerAuth": [],
+            "serverScope": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "uploadId",
+            "schema": {
+              "$ref": "#/components/schemas/AttachmentUploadId"
+            },
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Upload verification completed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CompleteAttachmentUploadSessionResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Upload is forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AttachmentUploadForbiddenError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Uploaded object is not visible yet",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UploadObjectNotFoundError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Upload verification is already in progress",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AttachmentUploadVerificationInProgressError"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "Upload session expired",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UploadSessionExpiredError"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Uploaded object failed verification",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UploadObjectMismatchError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/attachments/upload-sessions/{uploadId}": {
+      "delete": {
+        "operationId": "cancelAttachmentUploadSession",
+        "summary": "Cancel a direct attachment upload session",
+        "tags": [
+          "Attachment uploads"
+        ],
+        "security": [
+          {
+            "bearerAuth": [],
+            "serverScope": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "uploadId",
+            "schema": {
+              "$ref": "#/components/schemas/AttachmentUploadId"
+            },
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Upload session canceled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AttachmentUploadSessionView"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Upload is forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AttachmentUploadForbiddenError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Upload session does not exist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AttachmentUploadSessionNotFoundError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The completed upload is already attached to a message",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AttachmentAlreadyConsumedError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "operationId": "getAttachmentUploadSession",
+        "summary": "Get a direct attachment upload session",
+        "tags": [
+          "Attachment uploads"
+        ],
+        "security": [
+          {
+            "bearerAuth": [],
+            "serverScope": []
+          }
+        ],
+        "parameters": [
+          {
+            "in": "path",
+            "name": "uploadId",
+            "schema": {
+              "$ref": "#/components/schemas/AttachmentUploadId"
+            },
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current upload session",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AttachmentUploadSessionView"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Upload is forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AttachmentUploadForbiddenError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Upload session does not exist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AttachmentUploadSessionNotFoundError"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "CreateAttachmentUploadSessionRequest": {
+        "type": "object",
+        "properties": {
+          "channelId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+          },
+          "filename": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255
+          },
+          "mimeType": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255
+          },
+          "sizeBytes": {
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "maximum": 209715200
+          },
+          "clientRequestId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+          }
+        },
+        "required": [
+          "channelId",
+          "filename",
+          "mimeType",
+          "sizeBytes",
+          "clientRequestId"
+        ],
+        "additionalProperties": false
+      },
+      "AttachmentUploadId": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+      },
+      "AttachmentUploadCapabilities": {
+        "type": "object",
+        "properties": {
+          "directUploadEnabled": {
+            "type": "boolean"
+          },
+          "directUploadThresholdBytes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 209715200
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "maxBytes": {
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "maximum": 209715200
+          },
+          "sessionExpiresInSeconds": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 86400
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "directUploadEnabled",
+          "directUploadThresholdBytes",
+          "maxBytes",
+          "sessionExpiresInSeconds"
+        ],
+        "additionalProperties": false
+      },
+      "CreateAttachmentUploadSessionResponse": {
+        "type": "object",
+        "properties": {
+          "uploadId": {
+            "$ref": "#/components/schemas/AttachmentUploadId"
+          },
+          "attachmentId": {
+            "$ref": "#/components/schemas/AttachmentId"
+          },
+          "state": {
+            "type": "string",
+            "const": "pending"
+          },
+          "expiresAt": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$"
+          },
+          "upload": {
+            "type": "object",
+            "properties": {
+              "method": {
+                "type": "string",
+                "const": "PUT"
+              },
+              "url": {
+                "type": "string",
+                "format": "uri",
+                "description": "Short-lived presigned object-upload URL. Never log or persist this value.",
+                "readOnly": true
+              },
+              "headers": {
+                "type": "object",
+                "properties": {
+                  "Content-Type": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 255
+                  },
+                  "If-None-Match": {
+                    "type": "string",
+                    "const": "*"
+                  }
+                },
+                "required": [
+                  "Content-Type",
+                  "If-None-Match"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "method",
+              "url",
+              "headers"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "uploadId",
+          "attachmentId",
+          "state",
+          "expiresAt",
+          "upload"
+        ],
+        "additionalProperties": false
+      },
+      "AttachmentId": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+      },
+      "InvalidUploadRequestError": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "const": "UPLOAD_INVALID_REQUEST"
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1
+          },
+          "retryable": {
+            "type": "boolean",
+            "const": false
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "retryable"
+        ],
+        "additionalProperties": false
+      },
+      "AttachmentUploadForbiddenError": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "const": "UPLOAD_FORBIDDEN"
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1
+          },
+          "retryable": {
+            "type": "boolean",
+            "const": false
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "retryable"
+        ],
+        "additionalProperties": false
+      },
+      "AttachmentUploadIdempotencyConflictError": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "const": "UPLOAD_IDEMPOTENCY_CONFLICT"
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1
+          },
+          "retryable": {
+            "type": "boolean",
+            "const": false
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "retryable"
+        ],
+        "additionalProperties": false
+      },
+      "AttachmentUploadTooLargeError": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "const": "UPLOAD_TOO_LARGE"
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1
+          },
+          "retryable": {
+            "type": "boolean",
+            "const": false
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "retryable"
+        ],
+        "additionalProperties": false
+      },
+      "AttachmentUploadRateLimitedError": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "const": "UPLOAD_RATE_LIMITED"
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1
+          },
+          "retryable": {
+            "type": "boolean",
+            "const": true
+          },
+          "retryAfterMs": {
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "maximum": 300000
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "retryable",
+          "retryAfterMs"
+        ],
+        "additionalProperties": false
+      },
+      "CompleteAttachmentUploadSessionResponse": {
+        "type": "object",
+        "properties": {
+          "uploadId": {
+            "$ref": "#/components/schemas/AttachmentUploadId"
+          },
+          "state": {
+            "type": "string",
+            "const": "completed"
+          },
+          "attachment": {
+            "$ref": "#/components/schemas/AttachmentUploadResponse"
+          }
+        },
+        "required": [
+          "uploadId",
+          "state",
+          "attachment"
+        ],
+        "additionalProperties": false
+      },
+      "AttachmentUploadResponse": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/AttachmentId"
+          },
+          "filename": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255
+          },
+          "mimeType": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 255
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "sizeBytes": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 209715200
+          },
+          "thumbnailUrl": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uri"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "filename",
+          "mimeType",
+          "sizeBytes",
+          "thumbnailUrl"
+        ],
+        "additionalProperties": false
+      },
+      "UploadObjectNotFoundError": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "const": "UPLOAD_OBJECT_NOT_FOUND"
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1
+          },
+          "retryable": {
+            "type": "boolean",
+            "const": true
+          },
+          "retryAfterMs": {
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "maximum": 300000
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "retryable",
+          "retryAfterMs"
+        ],
+        "additionalProperties": false
+      },
+      "AttachmentUploadVerificationInProgressError": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "const": "UPLOAD_VERIFICATION_IN_PROGRESS"
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1
+          },
+          "retryable": {
+            "type": "boolean",
+            "const": true
+          },
+          "retryAfterMs": {
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "maximum": 300000
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "retryable",
+          "retryAfterMs"
+        ],
+        "additionalProperties": false
+      },
+      "UploadSessionExpiredError": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "const": "UPLOAD_SESSION_EXPIRED"
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1
+          },
+          "retryable": {
+            "type": "boolean",
+            "const": false
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "retryable"
+        ],
+        "additionalProperties": false
+      },
+      "UploadObjectMismatchError": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "const": "UPLOAD_OBJECT_MISMATCH"
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1
+          },
+          "retryable": {
+            "type": "boolean",
+            "const": false
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "retryable"
+        ],
+        "additionalProperties": false
+      },
+      "AttachmentUploadSessionView": {
+        "type": "object",
+        "properties": {
+          "uploadId": {
+            "$ref": "#/components/schemas/AttachmentUploadId"
+          },
+          "state": {
+            "$ref": "#/components/schemas/AttachmentUploadState"
+          },
+          "expiresAt": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$"
+          },
+          "attachment": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AttachmentUploadResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "terminalReason": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reservationState": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AttachmentReservationState"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "uploadId",
+          "state",
+          "expiresAt",
+          "attachment",
+          "terminalReason"
+        ],
+        "additionalProperties": false
+      },
+      "AttachmentUploadState": {
+        "type": "string",
+        "enum": [
+          "pending",
+          "verifying",
+          "completed",
+          "canceled",
+          "expired",
+          "failed"
+        ]
+      },
+      "AttachmentReservationState": {
+        "type": "string",
+        "enum": [
+          "pending",
+          "consumed",
+          "canceled",
+          "expired"
+        ]
+      },
+      "AttachmentUploadSessionNotFoundError": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "const": "UPLOAD_SESSION_NOT_FOUND"
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1
+          },
+          "retryable": {
+            "type": "boolean",
+            "const": false
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "retryable"
+        ],
+        "additionalProperties": false
+      },
+      "AttachmentAlreadyConsumedError": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "const": "ATTACHMENT_ALREADY_CONSUMED"
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1
+          },
+          "retryable": {
+            "type": "boolean",
+            "const": false
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "retryable"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      },
+      "serverScope": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Server-Id",
+        "description": "Server scope selected by the authenticated Raft member."
+      }
+    }
+  }
+}

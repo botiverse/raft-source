@@ -1,0 +1,1 @@
+ALTER TABLE "server_members" ADD COLUMN "hidden_dm_ids" json;

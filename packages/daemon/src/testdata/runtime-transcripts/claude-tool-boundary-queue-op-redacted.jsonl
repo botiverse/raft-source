@@ -1,0 +1,3 @@
+{"timestamp":"2026-05-24T09:49:20.765Z","type":"assistant","content":[{"type":"tool_use","name":"Read","input":{"file_path":"<redacted>"}}],"redacted":true}
+{"timestamp":"2026-05-24T09:49:20.813Z","type":"user","content":[{"type":"tool_result","tool_use_id":"<redacted>","content":"<redacted>"}],"redacted":true}
+{"timestamp":"2026-05-24T10:05:00.000Z","type":"queue-operation","operation":"message-delivered","redacted":true}

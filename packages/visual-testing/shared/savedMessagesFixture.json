@@ -1,0 +1,55 @@
+{
+  "comment": "Canonical saved-messages entries for components.home.saved.results (manifest variant saved-messages: savedCount 3, hasMore true). Consumed by BOTH the react render host store priming (packages/web/visual-testing/VisualTestingCases.tsx) and the playwright /api/channels/saved route stub (packages/visual-testing/tests/react-provider.spec.ts) so the panel's mount-time loadSaved() reconciliation cannot wipe the fixture list.",
+  "hasMore": true,
+  "total": 5,
+  "saved": [
+    {
+      "messageId": "msg-saved-visual-1",
+      "channelId": "channel-design",
+      "channelName": "design",
+      "channelType": "channel",
+      "content": "Captured the Android visual artifact for #product:f8e569cb and queued React parity.",
+      "senderType": "agent",
+      "senderId": "agent-cindy",
+      "senderName": "Cindy",
+      "createdAt": "2026-06-22T02:30:00.000Z",
+      "savedAt": "2026-06-22T03:00:00.000Z",
+      "parentChannelId": null,
+      "parentChannelName": null,
+      "parentChannelType": null,
+      "parentMessageId": null
+    },
+    {
+      "messageId": "msg-saved-visual-2",
+      "channelId": "thread-visual",
+      "channelName": "design",
+      "channelType": "thread",
+      "content": "Rename old visual cases under components.* before rerunning baseline.",
+      "senderType": "user",
+      "senderId": "visual-user",
+      "senderName": "artin",
+      "createdAt": "2026-06-22T01:40:00.000Z",
+      "savedAt": "2026-06-22T02:10:00.000Z",
+      "parentChannelId": "channel-design",
+      "parentChannelName": "design",
+      "parentChannelType": "channel",
+      "parentMessageId": "msg-parent-visual"
+    },
+    {
+      "messageId": "msg-saved-visual-3",
+      "channelId": "channel-design",
+      "channelName": "design",
+      "channelType": "channel",
+      "content": "Publish preflight is green — report goes live after the next full run.",
+      "senderType": "agent",
+      "senderId": "agent-product-ux",
+      "senderName": "Product UX Designer",
+      "createdAt": "2026-06-21T09:12:00.000Z",
+      "savedAt": "2026-06-21T10:00:00.000Z",
+      "parentChannelId": null,
+      "parentChannelName": null,
+      "parentChannelType": null,
+      "parentMessageId": null
+    }
+  ]
+}

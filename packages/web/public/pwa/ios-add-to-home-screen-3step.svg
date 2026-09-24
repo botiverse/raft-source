@@ -1,0 +1,148 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 86 900 260" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif">
+  <!-- Background -->
+  <rect width="900" height="360" fill="#FFF8E1"/>
+
+  <!-- ============ Title strip ============ -->
+  <text x="36" y="44" font-size="22" font-weight="800" fill="#0A0A0A">Add Raft to your Home Screen</text>
+  <text x="36" y="68" font-size="14" font-weight="500" fill="#0A0A0A" opacity="0.6">Open Raft as a fullscreen app — faster, more focused.</text>
+
+  <!-- ============ STEP 1: Tap Share ============ -->
+  <g transform="translate(36, 100)">
+    <!-- shadow -->
+    <rect x="6" y="6" width="260" height="220" fill="#0A0A0A" opacity="0.08"/>
+    <!-- card -->
+    <rect width="260" height="220" fill="#FFFFFF" stroke="#000000" stroke-width="3"/>
+
+    <!-- Step number + title row -->
+    <text x="24" y="64" font-size="44" font-weight="900" fill="#0A0A0A">1</text>
+    <text x="68" y="50" font-size="17" font-weight="800" fill="#0A0A0A">Tap Share</text>
+    <text x="68" y="68" font-size="12" font-weight="500" fill="#0A0A0A" opacity="0.55">in Safari's toolbar</text>
+
+    <!-- Visual: Safari toolbar fragment -->
+    <g transform="translate(28, 110)">
+      <!-- toolbar plate -->
+      <rect width="204" height="76" fill="#FFFFFF" stroke="#000000" stroke-width="2"/>
+
+      <!-- Back chevron -->
+      <g transform="translate(22, 38)" stroke="#0A0A0A" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" fill="none" opacity="0.45">
+        <path d="M 6 -8 L -2 0 L 6 8"/>
+      </g>
+      <!-- Forward chevron -->
+      <g transform="translate(58, 38)" stroke="#0A0A0A" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" fill="none" opacity="0.45">
+        <path d="M -6 -8 L 2 0 L -6 8"/>
+      </g>
+
+      <!-- Share button (highlighted) -->
+      <g transform="translate(82, 14)">
+        <!-- yellow chip with shadow -->
+        <rect x="3" y="3" width="44" height="44" fill="#0A0A0A" opacity="0.18"/>
+        <rect width="44" height="44" fill="#FFD440" stroke="#000000" stroke-width="2.5"/>
+        <!-- share icon: box with up arrow -->
+        <g transform="translate(22, 22)">
+          <rect x="-10" y="-3" width="20" height="14" fill="none" stroke="#0A0A0A" stroke-width="2.4"/>
+          <path d="M 0 -11 L 0 8 M -5 -6 L 0 -11 L 5 -6" fill="none" stroke="#0A0A0A" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+        </g>
+      </g>
+
+      <!-- Bookmark -->
+      <g transform="translate(146, 38)" stroke="#0A0A0A" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" fill="none" opacity="0.45">
+        <path d="M -6 -10 L -6 10 L 0 6 L 6 10 L 6 -10 Z"/>
+      </g>
+      <!-- Tabs (two overlapping squares) -->
+      <g transform="translate(180, 38)" stroke="#0A0A0A" stroke-width="2" fill="none" opacity="0.45">
+        <rect x="-9" y="-9" width="14" height="14"/>
+        <rect x="-5" y="-5" width="14" height="14"/>
+      </g>
+    </g>
+  </g>
+
+  <!-- ============ STEP 2: Add to Home Screen ============ -->
+  <g transform="translate(320, 100)">
+    <rect x="6" y="6" width="260" height="220" fill="#0A0A0A" opacity="0.08"/>
+    <rect width="260" height="220" fill="#FFFFFF" stroke="#000000" stroke-width="3"/>
+
+    <text x="24" y="64" font-size="44" font-weight="900" fill="#0A0A0A">2</text>
+    <text x="68" y="50" font-size="17" font-weight="800" fill="#0A0A0A">Add to Home Screen</text>
+    <text x="68" y="68" font-size="12" font-weight="500" fill="#0A0A0A" opacity="0.55">scroll the share menu</text>
+
+    <!-- Visual: 3 action rows -->
+    <g transform="translate(28, 110)">
+      <!-- Row 1: Copy (muted) -->
+      <g transform="translate(0, 0)">
+        <rect width="204" height="32" fill="#FFFFFF" stroke="#000000" stroke-width="1.5" opacity="0.5"/>
+        <!-- copy icon: two overlapping squares -->
+        <g transform="translate(14, 16)" stroke="#0A0A0A" stroke-width="1.5" fill="none" opacity="0.5">
+          <rect x="-7" y="-7" width="10" height="10"/>
+          <rect x="-3" y="-3" width="10" height="10"/>
+        </g>
+        <text x="34" y="20" font-size="12" font-weight="500" fill="#0A0A0A" opacity="0.55">Copy</text>
+      </g>
+
+      <!-- Row 2: Reading List (muted) -->
+      <g transform="translate(0, 32)">
+        <rect width="204" height="32" fill="#FFFFFF" stroke="#000000" stroke-width="1.5" opacity="0.5"/>
+        <!-- reading-list icon: glasses-y rect with line -->
+        <g transform="translate(14, 16)" stroke="#0A0A0A" stroke-width="1.5" fill="none" opacity="0.5">
+          <path d="M -7 -6 L 7 -6 L 7 6 L -7 6 Z M -7 -2 L 7 -2"/>
+        </g>
+        <text x="34" y="20" font-size="12" font-weight="500" fill="#0A0A0A" opacity="0.55">Add to Reading List</text>
+      </g>
+
+      <!-- Row 3: Add to Home Screen (HIGHLIGHTED) -->
+      <g transform="translate(0, 64)">
+        <!-- shadow -->
+        <rect x="3" y="3" width="204" height="36" fill="#0A0A0A" opacity="0.18"/>
+        <rect width="204" height="36" fill="#FFD440" stroke="#000000" stroke-width="2.5"/>
+        <!-- plus-in-square icon -->
+        <g transform="translate(18, 18)" stroke="#0A0A0A" stroke-width="2.2" fill="none">
+          <rect x="-9" y="-9" width="18" height="18" rx="2"/>
+          <line x1="0" y1="-5" x2="0" y2="5" stroke-linecap="round"/>
+          <line x1="-5" y1="0" x2="5" y2="0" stroke-linecap="round"/>
+        </g>
+        <text x="40" y="23" font-size="13" font-weight="800" fill="#0A0A0A">Add to Home Screen</text>
+      </g>
+    </g>
+  </g>
+
+  <!-- ============ STEP 3: Tap Add ============ -->
+  <g transform="translate(604, 100)">
+    <rect x="6" y="6" width="260" height="220" fill="#0A0A0A" opacity="0.08"/>
+    <rect width="260" height="220" fill="#FFFFFF" stroke="#000000" stroke-width="3"/>
+
+    <text x="24" y="64" font-size="44" font-weight="900" fill="#0A0A0A">3</text>
+    <text x="68" y="50" font-size="17" font-weight="800" fill="#0A0A0A">Tap Add</text>
+    <text x="68" y="68" font-size="12" font-weight="500" fill="#0A0A0A" opacity="0.55">confirm at the top-right</text>
+
+    <!-- Visual: dialog header + preview row -->
+    <g transform="translate(28, 110)">
+      <!-- dialog plate -->
+      <rect width="204" height="92" fill="#FFFFFF" stroke="#000000" stroke-width="2"/>
+
+      <!-- Header strip -->
+      <text x="12" y="22" font-size="11" font-weight="600" fill="#0A0A0A" opacity="0.55">Cancel</text>
+      <text x="102" y="22" font-size="11" font-weight="800" fill="#0A0A0A" text-anchor="middle">Home Screen</text>
+
+      <!-- Add button highlighted -->
+      <g transform="translate(160, 8)">
+        <rect x="2" y="2" width="36" height="20" fill="#0A0A0A" opacity="0.18"/>
+        <rect width="36" height="20" fill="#FFD440" stroke="#000000" stroke-width="2"/>
+        <text x="18" y="15" font-size="11" font-weight="900" fill="#0A0A0A" text-anchor="middle">Add</text>
+      </g>
+
+      <!-- Divider -->
+      <line x1="0" y1="36" x2="204" y2="36" stroke="#000000" stroke-width="1" opacity="0.2"/>
+
+      <!-- Preview row: S app icon + name + url -->
+      <g transform="translate(12, 48)">
+        <!-- App icon -->
+        <rect width="36" height="36" rx="8" fill="#FFD440" stroke="#000000" stroke-width="2"/>
+        <text x="18" y="26" font-size="18" font-weight="900" fill="#0A0A0A" text-anchor="middle">R</text>
+
+        <!-- Name -->
+        <text x="46" y="16" font-size="12" font-weight="800" fill="#0A0A0A">Raft</text>
+        <!-- URL -->
+        <text x="46" y="30" font-size="10" font-weight="500" fill="#0A0A0A" opacity="0.55" font-family="ui-monospace, Menlo, monospace">app.slock.ai</text>
+      </g>
+    </g>
+  </g>
+</svg>

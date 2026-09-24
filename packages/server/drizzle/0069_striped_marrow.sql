@@ -1,0 +1,1 @@
+ALTER TABLE "users" ADD COLUMN "auto_translation_enabled" boolean DEFAULT true NOT NULL;

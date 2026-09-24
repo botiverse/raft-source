@@ -1,0 +1,1 @@
+ALTER TABLE "users" ADD COLUMN "staging_self_account_capability_hash" text;

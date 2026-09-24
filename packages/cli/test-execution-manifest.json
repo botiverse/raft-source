@@ -1,0 +1,3382 @@
+{
+  "schemaVersion": 2,
+  "package": "@botiverse/raft",
+  "runner": "node --import tsx --test",
+  "testFileGlob": "src/**/*.test.ts",
+  "fileCount": 103,
+  "total": 918,
+  "files": [
+    {
+      "file": "src/agentApiNoBypass.test.ts",
+      "count": 5,
+      "cases": [
+        {
+          "name": "CLI command call sites use generated client bindings for migrated agent-api and daemon-api routes"
+        },
+        {
+          "name": "CLI command call sites use the id-less surface client for migrated agent-api routes"
+        },
+        {
+          "name": "no-bypass guard rejects synthetic id-less and legacy calls for every migrated route"
+        },
+        {
+          "name": "no-bypass guard ignores comments and non-migrated legacy routes"
+        },
+        {
+          "name": "no-bypass guard binds both HTTP method and exact route segments"
+        }
+      ]
+    },
+    {
+      "file": "src/agentApiPath.test.ts",
+      "count": 13,
+      "cases": [
+        {
+          "name": "contract path helpers encode typed query objects through route schemas"
+        },
+        {
+          "name": "requestContractAgentRoute decodes successful responses with the route response schema"
+        },
+        {
+          "name": "contract agent API client exposes resource methods over route-key implementation"
+        },
+        {
+          "name": "contract agent-api surface client exposes task list/create/unclaim/amend/history methods over id-less paths"
+        },
+        {
+          "name": "contract agent API client exposes channel and reaction methods"
+        },
+        {
+          "name": "contract agent-api surface client exposes remaining command methods over id-less paths"
+        },
+        {
+          "name": "contract agent-api surface client exposes migrated JSON route methods"
+        },
+        {
+          "name": "contract agent-api surface client uses id-less agent-api paths"
+        },
+        {
+          "name": "contract agent-api surface client exposes direct attachment session methods"
+        },
+        {
+          "name": "requestContractAgentRoute parses request bodies before dispatch"
+        },
+        {
+          "name": "requestContractAgentRoute rejects invalid request bodies before dispatch"
+        },
+        {
+          "name": "requestContractAgentRoute fails closed on response contract drift"
+        },
+        {
+          "name": "requestContractAgentRoute preserves a typed known-response proxy failure"
+        }
+      ]
+    },
+    {
+      "file": "src/agentCommsCore/bridge.test.ts",
+      "count": 15,
+      "cases": [
+        {
+          "name": "bridge records wake-only proofs and never stores body or upgrades to model_seen/read"
+        },
+        {
+          "name": "bridge can call a wake adapter after harness acceptance without cursor authority"
+        },
+        {
+          "name": "bridge replays locally accepted wake hints on restart without duplicating wake-dedup state"
+        },
+        {
+          "name": "bridge state is isolated by agent, profile, and adapter instance"
+        },
+        {
+          "name": "bridge lock enforces single owner per agent, profile, and adapter instance"
+        },
+        {
+          "name": "bridge lock reclaims a stale lock when the recorded pid is gone"
+        },
+        {
+          "name": "bridge fails closed without a self-hosted profile credential"
+        },
+        {
+          "name": "bridge drains plugin activity, truncates content, and does not forward transcript paths"
+        },
+        {
+          "name": "activity sanitizer keeps tool content but strips non-contract hook payload fields"
+        },
+        {
+          "name": "activity sanitizer preserves plugin 0.3.0 event-level truncation provenance"
+        },
+        {
+          "name": "wake hint is pruned from the replay ledger after successful injection (task #77)"
+        },
+        {
+          "name": "wake hint stays in the replay ledger when injection fails (no-drop)"
+        },
+        {
+          "name": "reconcile re-injects still-pending hints and leaves the session cursor untouched (EAB-7)"
+        },
+        {
+          "name": "reconcile does not re-inject consumed hints (empty pending) nor fresh wakes inside the grace window"
+        },
+        {
+          "name": "bridge.log: store.appendLog writes timestamped NDJSON and rotates at the size cap"
+        }
+      ]
+    },
+    {
+      "file": "src/agentLogin/deviceAuthClient.test.ts",
+      "count": 7,
+      "cases": [
+        {
+          "name": "runDeviceCodeLogin drives authorize → onUserAction → token poll"
+        },
+        {
+          "name": "runDeviceCodeLogin throws DeviceCodeLoginError on access_denied"
+        },
+        {
+          "name": "runDeviceCodeLogin throws on device_login_disabled (authorize-side 404)"
+        },
+        {
+          "name": "authorizeDeviceCode returns the handle + absolutized verificationUriComplete"
+        },
+        {
+          "name": "runDeviceCodeLogin surfaces verificationUriComplete to onUserAction"
+        },
+        {
+          "name": "pollDeviceToken resumes polling with a device_code and returns the session"
+        },
+        {
+          "name": "pollDeviceToken throws expired_token once the deadline passes"
+        }
+      ]
+    },
+    {
+      "file": "src/auth/env.test.ts",
+      "count": 23,
+      "cases": [
+        {
+          "name": "env: rejects legacy literal machine token"
+        },
+        {
+          "name": "env: rejects legacy file machine token"
+        },
+        {
+          "name": "env: local agent proxy wins over legacy token files"
+        },
+        {
+          "name": "env: local agent proxy can read token from daemon-owned token file"
+        },
+        {
+          "name": "env: local agent proxy rejects ambiguous token sources"
+        },
+        {
+          "name": "env: missing agent id throws"
+        },
+        {
+          "name": "env: missing token throws"
+        },
+        {
+          "name": "env: empty proxy token file throws"
+        },
+        {
+          "name": "env: SLOCK_SERVER_ID is optional in v0"
+        },
+        {
+          "name": "env: RAFT_PROFILE reads credential file and produces self-hosted-runner ctx"
+        },
+        {
+          "name": "env: RAFT_PROFILE missing serverId is allowed (defaults to null)"
+        },
+        {
+          "name": "env: RAFT_PROFILE wins over raw agent env vars and warns to stderr"
+        },
+        {
+          "name": "env: managed launch markers reject an ambient profile before reading another identity"
+        },
+        {
+          "name": "env: RAFT_PROFILE with unreadable file throws PROFILE_FILE_UNREADABLE"
+        },
+        {
+          "name": "env: RAFT_PROFILE with malformed JSON throws PROFILE_FILE_INVALID"
+        },
+        {
+          "name": "env: RAFT_PROFILE with missing apiKey throws PROFILE_FILE_INVALID"
+        },
+        {
+          "name": "env: RAFT_PROFILE forwards SLOCK_AGENT_ACTIVE_CAPABILITIES filter"
+        },
+        {
+          "name": "env: RAFT_PROFILE resolves under SLOCK_HOME/profiles/<slug> when set"
+        },
+        {
+          "name": "env: RAFT_PROFILE_DIR wins over SLOCK_HOME (explicit override)"
+        },
+        {
+          "name": "env: fresh SLOCK_HOME with no profile throws PROFILE_FILE_UNREADABLE without touching $HOME/.slock"
+        },
+        {
+          "name": "env: no home roots set falls back to $HOME/.slock/profiles/<slug>"
+        },
+        {
+          "name": "env: SLOCK_PROFILE alias still selects a profile; conflicting RAFT/SLOCK values fail closed"
+        },
+        {
+          "name": "env: RAFT_HOME takes precedence over SLOCK_HOME (§10 isolation still honored)"
+        }
+      ]
+    },
+    {
+      "file": "src/auth/managedTransport.test.ts",
+      "count": 5,
+      "cases": [
+        {
+          "name": "managed transport: a host-global CLI resolves the exact current-launch wrapper"
+        },
+        {
+          "name": "managed transport: forwarding executes the wrapper instead of continuing with ambient profile"
+        },
+        {
+          "name": "managed transport: arbitrary or symlink transport directories fail closed"
+        },
+        {
+          "name": "managed transport: wrapper-authenticated invocation does not recurse"
+        },
+        {
+          "name": "managed transport: the real CLI entry forwards before parsing or profile auth"
+        }
+      ]
+    },
+    {
+      "file": "src/axManifest.test.ts",
+      "count": 2,
+      "cases": [
+        {
+          "name": "manifest covers both sides and the standing prompt"
+        },
+        {
+          "name": "branded mint-site gate is clean (raw `as Brand` casts only in declared utils)"
+        }
+      ]
+    },
+    {
+      "file": "src/bundleConfig.test.ts",
+      "count": 1,
+      "cases": [
+        {
+          "name": "tsup config inlines runtime deps for the Computer app sidecar CLI"
+        }
+      ]
+    },
+    {
+      "file": "src/client.test.ts",
+      "count": 24,
+      "cases": [
+        {
+          "name": "ApiClient marks requests as slock CLI traffic"
+        },
+        {
+          "name": "ApiClient rewrites supported legacy paths when using sk_agent credential"
+        },
+        {
+          "name": "ApiClient sends explicit agent-api paths through the local agent proxy without rewriting"
+        },
+        {
+          "name": "ApiClient exposes a binary request helper without choosing attachment routes"
+        },
+        {
+          "name": "ApiClient follows one HTTPS attachment redirect without forwarding Raft credentials"
+        },
+        {
+          "name": "ApiClient fails closed on expired or unapproved attachment redirects without exposing the signed URL"
+        },
+        {
+          "name": "ApiClient scrubs a signed object URL from attachment transport traces and errors"
+        },
+        {
+          "name": "ApiClient rewrites server info and channel membership paths for sk_agent credential"
+        },
+        {
+          "name": "ApiClient rewrites mention action paths for sk_agent credential"
+        },
+        {
+          "name": "ApiClient maps agent-api events response to legacy message check shape"
+        },
+        {
+          "name": "ApiClient rewrites 403 scope deny with current human remediation"
+        },
+        {
+          "name": "ApiClient leaves non-scope 403s untouched"
+        },
+        {
+          "name": "ApiClient preserves server code and suggested next action from error bodies"
+        },
+        {
+          "name": "ApiClient surfaces invalid JSON responses instead of returning null data"
+        },
+        {
+          "name": "ApiClient traces HTTP 5xx before command-level SERVER_5XX normalization"
+        },
+        {
+          "name": "CLI transport traces keep bare ETIMEDOUT distinct from explicit read timeouts"
+        },
+        {
+          "name": "ApiClient centrally raises local daemon proxy diagnostics from 5xx envelopes"
+        },
+        {
+          "name": "ApiClient centrally raises marked streaming body failures as mid-response proxy diagnostics"
+        },
+        {
+          "name": "ApiClient keeps complete malformed marked JSON as INVALID_JSON_RESPONSE"
+        },
+        {
+          "name": "ApiClient preserves successful marked binary streams"
+        },
+        {
+          "name": "ApiClient traces local daemon loopback failures without leaking raw URL"
+        },
+        {
+          "name": "ApiClient classifies api.slock.ai proxy connect failures as transport failures"
+        },
+        {
+          "name": "ApiClient classifies api.raft.build as the Raft API host"
+        },
+        {
+          "name": "transport route family classifier returns only closed route families"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/action/prepare.test.ts",
+      "count": 21,
+      "cases": [
+        {
+          "name": "resolveActionInput parses well-formed channel:create JSON"
+        },
+        {
+          "name": "resolveActionInput strips a leading UTF-8 BOM from stdin JSON"
+        },
+        {
+          "name": "resolveActionInput parses agent:create with only name + description"
+        },
+        {
+          "name": "actionCardActionSchema accepts structured computer placement on agent:create"
+        },
+        {
+          "name": "validateActionCardAction rejects both suggested and required computers"
+        },
+        {
+          "name": "resolveActionInput rejects empty stdin"
+        },
+        {
+          "name": "resolveActionInput rejects whitespace-only stdin"
+        },
+        {
+          "name": "resolveActionInput rejects TTY stdin without reading"
+        },
+        {
+          "name": "resolveActionInput surfaces a parse error for invalid JSON"
+        },
+        {
+          "name": "actionCardActionSchema accepts channel:add_member with at least one human"
+        },
+        {
+          "name": "actionCardActionSchema accepts channel:add_member with only agents"
+        },
+        {
+          "name": "validateActionCardAction rejects channel:add_member with no humans and no agents"
+        },
+        {
+          "name": "validateActionCardAction returns null for valid channel:add_member"
+        },
+        {
+          "name": "actionCardActionSchema rejects migration:export"
+        },
+        {
+          "name": "actionCardActionSchema accepts handles for channel / humans / agents"
+        },
+        {
+          "name": "actionCardActionSchema accepts handles for channel:create initial members"
+        },
+        {
+          "name": "actionCardActionSchema rejects empty-string channel reference"
+        },
+        {
+          "name": "looksLikeUuid accepts canonical v1-v8 / nil / max UUIDs"
+        },
+        {
+          "name": "looksLikeUuid rejects handles and malformed strings"
+        },
+        {
+          "name": "extractHandleName strips the sigil when present and trims"
+        },
+        {
+          "name": "actionCardActionSchema rejects agent-prefilled runtime/model fields on agent:create"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/agent/_format.test.ts",
+      "count": 5,
+      "cases": [
+        {
+          "name": "formatLoginStateMissing matches pre-move login.ts bytes"
+        },
+        {
+          "name": "formatAlreadyLoggedIn matches pre-move login.ts bytes"
+        },
+        {
+          "name": "formatCredentialRemintNotice matches pre-move login.ts bytes"
+        },
+        {
+          "name": "bridge diagnostics match pre-move bridge.ts bytes"
+        },
+        {
+          "name": "formatVerificationHandoff matches the pre-move inline list.ts bytes (both variants)"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/agent/bridge.test.ts",
+      "count": 21,
+      "cases": [
+        {
+          "name": "agent bridge is an explicit agent subcommand with JSON protocol mode"
+        },
+        {
+          "name": "agent bridge requires an independent expected identity before any request"
+        },
+        {
+          "name": "agent bridge rejects a profile/expected-agent mismatch with zero requests"
+        },
+        {
+          "name": "agent bridge polls content-free wake hints, not draining events"
+        },
+        {
+          "name": "agent bridge can emit Claude Code wake adapter failures without consuming message bodies"
+        },
+        {
+          "name": "agent bridge passes Claude channel token from env instead of argv"
+        },
+        {
+          "name": "agent bridge consumes wake-hint stream as a non-cursor peek source"
+        },
+        {
+          "name": "agent bridge drains buffered wake-hint stream bursts before reading the next chunk"
+        },
+        {
+          "name": "agent bridge treats a stalled wake-hint stream as retryable and falls back to poll catch-up"
+        },
+        {
+          "name": "agent bridge treats malformed wake-hint stream events as retryable stream failures"
+        },
+        {
+          "name": "agent bridge fails visible when the profile bridge lock is already held"
+        },
+        {
+          "name": "classifyBridgeLoopError: 5xx and transport throws retry, 4xx and unknown fail closed"
+        },
+        {
+          "name": "bridge loop retries a transient 5xx with backoff, recovers, and fails closed on 4xx"
+        },
+        {
+          "name": "bridge loop reports fatal bridge errors through agent activity before exit"
+        },
+        {
+          "name": "bridge --once surfaces even transient errors (debug single-shot)"
+        },
+        {
+          "name": "retry loop replays locally pending hints at most once per process (Stone's #2783 blocker)"
+        },
+        {
+          "name": "bridge loop reconciles on interval and tees lifecycle events to bridge.log regardless of --json"
+        },
+        {
+          "name": "reconciliation fires on a healthy idle stream that sends only heartbeats (EAB-7 bounded-time)"
+        },
+        {
+          "name": "RED: without fast reconcile, unconsumed hints wait for the full reconcile interval (delivery gap)"
+        },
+        {
+          "name": "GREEN: fast reconcile fires shortly after processing wake hints (delivery stability)"
+        },
+        {
+          "name": "wake-channel is the only adapter kind; old names fail closed"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/agent/list.test.ts",
+      "count": 4,
+      "cases": [
+        {
+          "name": "describeListResult: ok includes the next CLI command with serverUrl interpolated"
+        },
+        {
+          "name": "describeListResult: no_manageable_server points at credential authority recovery"
+        },
+        {
+          "name": "describeListResult: no_agents_on_manageable_servers tells the operator to create an agent"
+        },
+        {
+          "name": "describeListResult: every reason returns non-empty copy (contract — CLI must always have a next step)"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/agent/login.test.ts",
+      "count": 20,
+      "cases": [
+        {
+          "name": "authorized login report gives both audiences an executable Manual next step"
+        },
+        {
+          "name": "describeInvalidAgentIdShape: rejects @handle"
+        },
+        {
+          "name": "describeInvalidAgentIdShape: rejects #channel name"
+        },
+        {
+          "name": "describeInvalidAgentIdShape: rejects URLs"
+        },
+        {
+          "name": "describeInvalidAgentIdShape: rejects empty / whitespace-only"
+        },
+        {
+          "name": "describeInvalidAgentIdShape: accepts plausible agent ids"
+        },
+        {
+          "name": "credential-mint denial names the action capability and human-creator recovery path"
+        },
+        {
+          "name": "ordinary login consumes an existing token from pipe without device authorization or minting"
+        },
+        {
+          "name": "ordinary login consumes an existing token from tty without device authorization or minting"
+        },
+        {
+          "name": "direct login preserves the profile on revoked"
+        },
+        {
+          "name": "direct login preserves the profile on wrong-agent"
+        },
+        {
+          "name": "direct login preserves the profile on malformed"
+        },
+        {
+          "name": "direct login preserves the profile on server-error"
+        },
+        {
+          "name": "direct login preserves the profile on redirect"
+        },
+        {
+          "name": "direct login preserves the profile on existing-mismatch"
+        },
+        {
+          "name": "direct login preserves the profile on existing-unreachable"
+        },
+        {
+          "name": "login subcommand uses --profile-slug, never --profile (root-shadow contract)"
+        },
+        {
+          "name": "login subcommand --profile-dir option preserved (separate semantics from --profile-slug)"
+        },
+        {
+          "name": "login exposes the agent-safe start / wait / status subcommands"
+        },
+        {
+          "name": "login start parses --server/--agent written after the subcommand (parent-shadow regression)"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/app/_format.test.ts",
+      "count": 1,
+      "cases": [
+        {
+          "name": "formatAppConfig matches pre-move config.ts bytes"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/app/config.test.ts",
+      "count": 5,
+      "cases": [
+        {
+          "name": "app config without mutation flags shows effective values and their sources"
+        },
+        {
+          "name": "app config applies repeated set and unset flags in one revision-bound PATCH"
+        },
+        {
+          "name": "documented Cleaner notification commands execute with exact generic CLI arguments"
+        },
+        {
+          "name": "invalid or duplicate mutations fail before auth bootstrap or network access"
+        },
+        {
+          "name": "revision conflicts preserve the typed server error and give a retry action"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/attachment/_format.test.ts",
+      "count": 3,
+      "cases": [
+        {
+          "name": "formatAttachmentUploaded matches pre-move upload.ts bytes"
+        },
+        {
+          "name": "formatAttachmentDownloaded matches pre-move view.ts bytes"
+        },
+        {
+          "name": "formatAttachmentComments matches pre-move comments.ts bytes (empty and list)"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/attachment/upload.test.ts",
+      "count": 14,
+      "cases": [
+        {
+          "name": "inferUploadMimeType detects images from magic bytes without an extension"
+        },
+        {
+          "name": "inferUploadMimeType falls back to filename and then octet-stream"
+        },
+        {
+          "name": "inferUploadMimeType lets explicit MIME override detection"
+        },
+        {
+          "name": "normalizeExplicitMimeType validates type/subtype shape"
+        },
+        {
+          "name": "validateUploadFileSize rejects empty attachments before upload"
+        },
+        {
+          "name": "validateUploadFileSize rejects files over 50MB before upload"
+        },
+        {
+          "name": "direct PUT treats a write-once 412 as an already uploaded object"
+        },
+        {
+          "name": "direct PUT retries a lost response and recovers through write-once 412"
+        },
+        {
+          "name": "attachment upload preserves server quota error code and next action"
+        },
+        {
+          "name": "attachment upload preserves typed proxy timeout diagnostics"
+        },
+        {
+          "name": "attachment upload accepts legacy --channel alias during target transition"
+        },
+        {
+          "name": "attachment upload falls back to legacy multipart when capabilities are unavailable"
+        },
+        {
+          "name": "attachment upload fails closed on non-404 capability errors"
+        },
+        {
+          "name": "attachment upload completes once after a lost PUT response recovers as 412"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/attachment/view.test.ts",
+      "count": 10,
+      "cases": [
+        {
+          "name": "attachment view command advertises positional id while keeping --id alias"
+        },
+        {
+          "name": "attachment view command uses injected ApiClient and writes file"
+        },
+        {
+          "name": "attachment view command accepts positional attachment id"
+        },
+        {
+          "name": "attachment view command maps missing output into typed CliError"
+        },
+        {
+          "name": "attachment view command maps missing attachment id into typed CliError"
+        },
+        {
+          "name": "attachment view command rejects conflicting positional and --id values"
+        },
+        {
+          "name": "attachment view command preserves output path literally"
+        },
+        {
+          "name": "attachment view command cloaks all 404 causes and points feedback artifacts to reportId"
+        },
+        {
+          "name": "attachment view command keeps non-404 auth and server failures distinct"
+        },
+        {
+          "name": "attachment view command does not write a file or signed URL on an expired object response"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/auth/whoami.test.ts",
+      "count": 1,
+      "cases": [
+        {
+          "name": "whoami command uses injected context and redacts token"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/channel/add-member.test.ts",
+      "count": 4,
+      "cases": [
+        {
+          "name": "add-member output reports member type and idempotent membership"
+        },
+        {
+          "name": "add-member command posts normalized user handle payload"
+        },
+        {
+          "name": "add-member command posts normalized agent handle payload"
+        },
+        {
+          "name": "add-member command requires exactly one member selector"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/channel/create.test.ts",
+      "count": 4,
+      "cases": [
+        {
+          "name": "create channel output reports created channel visibility"
+        },
+        {
+          "name": "create channel command posts normalized channel payload"
+        },
+        {
+          "name": "create channel command maps missing name into typed CliError"
+        },
+        {
+          "name": "create channel direct Agent API request preserves proxy diagnostics centrally"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/channel/info.test.ts",
+      "count": 3,
+      "cases": [
+        {
+          "name": "channel info command returns narrow visible channel facts and member counts"
+        },
+        {
+          "name": "channel info maps missing or inaccessible channels to typed error with next action"
+        },
+        {
+          "name": "channel info rejects thread targets before auth bootstrap"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/channel/join.test.ts",
+      "count": 5,
+      "cases": [
+        {
+          "name": "join channel output explains post-join delivery"
+        },
+        {
+          "name": "join channel command uses injected ApiClient and writes join result"
+        },
+        {
+          "name": "join channel command maps invalid target into typed CliError"
+        },
+        {
+          "name": "join channel command preserves already-joined and not-found semantics from the SDK"
+        },
+        {
+          "name": "join channel command maps SDK transport stages to existing CLI error codes"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/channel/leave.test.ts",
+      "count": 4,
+      "cases": [
+        {
+          "name": "parseRegularChannelTarget accepts only top-level channel targets"
+        },
+        {
+          "name": "leave channel output explains post-leave access"
+        },
+        {
+          "name": "leave channel command uses injected ApiClient and writes leave result"
+        },
+        {
+          "name": "leave channel command maps invalid target into typed CliError"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/channel/lifecycle.test.ts",
+      "count": 4,
+      "cases": [
+        {
+          "name": "channel lifecycle output states the resulting write contract"
+        },
+        {
+          "name": "archive sends one contract-backed lifecycle request"
+        },
+        {
+          "name": "unarchive sends one contract-backed lifecycle request"
+        },
+        {
+          "name": "channel lifecycle rejects non-channel targets before loading credentials"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/channel/members.test.ts",
+      "count": 3,
+      "cases": [
+        {
+          "name": "channel members command uses injected ApiClient and encodes target"
+        },
+        {
+          "name": "channel members command maps server failures into typed CliError"
+        },
+        {
+          "name": "channel members command maps missing target into typed CliError"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/channel/mute.test.ts",
+      "count": 6,
+      "cases": [
+        {
+          "name": "channel mute output carries self-explaining attention details"
+        },
+        {
+          "name": "channel mute command resolves channel and calls agent mute endpoint"
+        },
+        {
+          "name": "channel mute command accepts canonical --target option"
+        },
+        {
+          "name": "channel unmute command resolves channel and calls agent unmute endpoint"
+        },
+        {
+          "name": "channel mute command maps invalid target into typed CliError"
+        },
+        {
+          "name": "channel mute command rejects conflicting positional and --target values"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/channel/remove-member.test.ts",
+      "count": 3,
+      "cases": [
+        {
+          "name": "remove-member output distinguishes removed and already absent"
+        },
+        {
+          "name": "remove-member command sends DELETE body with normalized handle"
+        },
+        {
+          "name": "remove-member command requires exactly one member selector"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/channel/update.test.ts",
+      "count": 3,
+      "cases": [
+        {
+          "name": "update channel output reports channel visibility"
+        },
+        {
+          "name": "update channel command resolves target and patches normalized payload"
+        },
+        {
+          "name": "update channel command rejects empty updates and conflicting visibility"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/frameworkMigration.test.ts",
+      "count": 6,
+      "cases": [
+        {
+          "name": "missing required options fail as INVALID_ARG before auth bootstrap"
+        },
+        {
+          "name": "newly migrated commands use injected client and write canonical success output"
+        },
+        {
+          "name": "newly migrated commands map server failures to CliError"
+        },
+        {
+          "name": "task claim maps daemon proxy 5xx envelopes to proxy-scoped CliError"
+        },
+        {
+          "name": "task claim accepts legacy --channel alias during target transition"
+        },
+        {
+          "name": "task claim rejects conflicting --target and legacy --channel before auth bootstrap"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/inbox/check.test.ts",
+      "count": 6,
+      "cases": [
+        {
+          "name": "inbox check command renders pending target snapshot without content"
+        },
+        {
+          "name": "inbox check command rejects non-managed runners before network I/O"
+        },
+        {
+          "name": "inbox check command renders empty snapshot"
+        },
+        {
+          "name": "inbox check command uses inbox-specific failure code"
+        },
+        {
+          "name": "inbox check command message-only response is byte-compatible with shared snapshot formatter"
+        },
+        {
+          "name": "inbox check command renders structured sourceRef and exact actionCli from OS mint"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/integration/_format.test.ts",
+      "count": 8,
+      "cases": [
+        {
+          "name": "formatIntegrationLogin makes agent login completion explicit"
+        },
+        {
+          "name": "formatIntegrationLogin omits agent manifest line when service has none"
+        },
+        {
+          "name": "formatIntegrationLogin explains human approval requirement"
+        },
+        {
+          "name": "formatIntegrationLogin identifies a public app that still needs a Server install"
+        },
+        {
+          "name": "formatIntegrationList only prints manifest line for services that declare one"
+        },
+        {
+          "name": "formatIntegrationList separates built-in Raft apps from registered services"
+        },
+        {
+          "name": "formatIntegrationList keeps its observation boundary at the inventory decision point"
+        },
+        {
+          "name": "formatIntegrationList projects a structured scope mutation into its first decision unit"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/integration/_session.test.ts",
+      "count": 2,
+      "cases": [
+        {
+          "name": "cookieHeaderForUrl enforces exact host, path, Secure, and expiry scope"
+        },
+        {
+          "name": "cookie path matching honors browser path-segment boundaries"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/integration/app.test.ts",
+      "count": 24,
+      "cases": [
+        {
+          "name": "integration app list/status reconstruct pending and committed state without secret-shaped fields"
+        },
+        {
+          "name": "integration app list gives an explicit non-owner handoff instead of a generic no-action dead end"
+        },
+        {
+          "name": "integration app prepare register posts sanitized action-card request"
+        },
+        {
+          "name": "integration app prepare register allows server-generated client key"
+        },
+        {
+          "name": "integration app CLI does not expose the legacy prepare-update authority path"
+        },
+        {
+          "name": "integration app rotate-secret writes only to a new mode-0600 sink and emits a sanitized receipt"
+        },
+        {
+          "name": "integration app rotate-secret JSON emits only the fixed private-sink receipt"
+        },
+        {
+          "name": "integration app rotate-secret rejects an existing sink before POST without changing bytes or mode"
+        },
+        {
+          "name": "integration app rotate-secret creates no sink when agent context bootstrap fails"
+        },
+        {
+          "name": "integration app rotate-secret creates no sink when API client construction fails"
+        },
+        {
+          "name": "integration app rotate-secret retains a private empty sink with cleanup guidance when the API fails"
+        },
+        {
+          "name": "integration app rotate-secret does not replay credential-shaped transport errors"
+        },
+        {
+          "name": "integration app rotate-secret rejects a swapped success path without touching the replacement or emitting a receipt"
+        },
+        {
+          "name": "integration app rotate-secret API cleanup leaves a swapped replacement untouched"
+        },
+        {
+          "name": "private secret sink close never unlinks its selected path or a replacement"
+        },
+        {
+          "name": "private secret sink reports a post-rotation write failure without disclosing the secret"
+        },
+        {
+          "name": "integration app rotate-secret requires an output before POST and private sinks fail closed on win32"
+        },
+        {
+          "name": "integration app update and transfer-owner call owner-or-admin direct routes"
+        },
+        {
+          "name": "integration app update JSON emits only the fixed mutation receipt"
+        },
+        {
+          "name": "integration app transfer-owner JSON emits a fixed audited no-op receipt"
+        },
+        {
+          "name": "integration app distribution commands use the shared manage route without replaying share tokens"
+        },
+        {
+          "name": "integration app share-link fails closed when the one-time URL is missing"
+        },
+        {
+          "name": "integration app logo uploads multipart bytes to the dedicated route"
+        },
+        {
+          "name": "integration app prepare recover-owner creates an admin-only recovery card"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/integration/appManualContract.test.ts",
+      "count": 5,
+      "cases": [
+        {
+          "name": "the manual locates the repo it documents"
+        },
+        {
+          "name": "every rotate-secret flag the manual names is a flag the CLI defines"
+        },
+        {
+          "name": "NEGATIVE CONTROL: a documented flag the CLI lacks is actually rejected"
+        },
+        {
+          "name": "the manual pairs --output with the flag-list self-check, not a version number"
+        },
+        {
+          "name": "the manual warns that probing costs the live secret"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/integration/appReceipts.test.ts",
+      "count": 3,
+      "cases": [
+        {
+          "name": "direct app read receipts recursively project only declared app fields"
+        },
+        {
+          "name": "direct app mutation receipts use action-specific fixed projections"
+        },
+        {
+          "name": "remaining direct app receipts also drop undeclared response fields"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/integration/env.test.ts",
+      "count": 17,
+      "cases": [
+        {
+          "name": "resolveIntegrationEnv returns per-agent HOME exports for explicit local_cli boundary"
+        },
+        {
+          "name": "integration env command writes per-agent HOME exports for explicit local_cli boundary"
+        },
+        {
+          "name": "integration env never materializes credentials for a v1 local CLI surface"
+        },
+        {
+          "name": "integration env command rejects missing --service as INVALID_ARG"
+        },
+        {
+          "name": "integration env command returns no-op success when service declares no manifest"
+        },
+        {
+          "name": "integration env command returns JSON no-op success when service declares no manifest"
+        },
+        {
+          "name": "integration env command treats missing well-known manifest as no-op success"
+        },
+        {
+          "name": "integration env command treats inferred well-known HTML fallback as no-op success"
+        },
+        {
+          "name": "integration env command fails closed for explicit manifest HTML fallback"
+        },
+        {
+          "name": "integration env command returns no-op success for no-boundary manifest without context_check"
+        },
+        {
+          "name": "integration env command points HTTP API action services to integration invoke"
+        },
+        {
+          "name": "integration env command includes HTTP API actions in JSON no-op output"
+        },
+        {
+          "name": "integration env command fails closed when per_agent_home omits forbid_user_home=true"
+        },
+        {
+          "name": "resolveIntegrationEnv treats absent manifests as no-op success"
+        },
+        {
+          "name": "resolveIntegrationEnv treats HTTP 404 manifests as no-op success"
+        },
+        {
+          "name": "resolveIntegrationEnv treats no-boundary manifests as no-op success even without context_check"
+        },
+        {
+          "name": "resolveIntegrationEnv fails closed when per_agent_home omits forbid_user_home=true"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/integration/invoke.test.ts",
+      "count": 103,
+      "cases": [
+        {
+          "name": "integration invoke sends feedback-admin id in URL and param content in POST JSON body"
+        },
+        {
+          "name": "integration invoke sends feedback-admin id in URL and data-json content in POST body"
+        },
+        {
+          "name": "integration invoke sends feedback-admin id in URL and data-file content in POST body"
+        },
+        {
+          "name": "integration invoke writes a file-response action to a temporary file and prints the path"
+        },
+        {
+          "name": "integration invoke preserves and redacts structured errors from file-response actions without writing a file"
+        },
+        {
+          "name": "integration invoke recursively redacts a structured file-response error with missing Content-Type and writes no file"
+        },
+        {
+          "name": "integration invoke writes a file-response action to --output path"
+        },
+        {
+          "name": "integration invoke emits file path in JSON mode for file-response actions"
+        },
+        {
+          "name": "integration invoke file response creates private default temp directory and file"
+        },
+        {
+          "name": "integration invoke rejects v0 array and object fields passed through text --param before login"
+        },
+        {
+          "name": "integration invoke preserves typed v0 arrays and objects from --data-json"
+        },
+        {
+          "name": "integration invoke help identifies --param as text-only and points structured fields to typed JSON"
+        },
+        {
+          "name": "integration invoke file response rejects non-POSIX platform for default temp"
+        },
+        {
+          "name": "integration invoke file response creates private file under explicit --output"
+        },
+        {
+          "name": "integration invoke file response enforces private mode even under restrictive umask"
+        },
+        {
+          "name": "integration invoke file response cleans up default temp dir when chmod fails"
+        },
+        {
+          "name": "integration invoke file response reports default temp dir retained when chmod and cleanup fail"
+        },
+        {
+          "name": "integration invoke file response reports staging temp dir retained when chmod and cleanup fail"
+        },
+        {
+          "name": "integration invoke file response reports staging temp dir retained when temp file fchmod and cleanup fail"
+        },
+        {
+          "name": "integration invoke file response cleans up default temp dir when statSync postcondition fails"
+        },
+        {
+          "name": "integration invoke file response reports default temp dir retained when statSync and cleanup fail"
+        },
+        {
+          "name": "integration invoke file response cleans up default temp dir when staging mkdir fails"
+        },
+        {
+          "name": "integration invoke file response reports default temp dir retained when staging mkdir fails and cleanup fails"
+        },
+        {
+          "name": "integration invoke file response retains explicit output ancestor when staging mkdir fails"
+        },
+        {
+          "name": "integration invoke file response reports partial effect when recursive output mkdir fails after creating ancestor"
+        },
+        {
+          "name": "integration invoke file response cleans up staging temp dir when chmod fails"
+        },
+        {
+          "name": "integration invoke file response cleans up staging temp dir when statSync postcondition fails"
+        },
+        {
+          "name": "integration invoke file response cleans up temp file when fchmod fails"
+        },
+        {
+          "name": "integration invoke file response cleans up temp file when fstatSync postcondition fails"
+        },
+        {
+          "name": "integration invoke file response does not retry cleanup after a single rmSync failure"
+        },
+        {
+          "name": "integration invoke file response rejects declared size exceeding maxBytes before streaming"
+        },
+        {
+          "name": "integration invoke file response aborts streaming when actual bytes exceed maxBytes"
+        },
+        {
+          "name": "integration invoke file response reports partial cleanup failure on size limit overflow"
+        },
+        {
+          "name": "integration invoke file response honors manifest response.maxBytes"
+        },
+        {
+          "name": "integration invoke rejects --output for v0 non-file-response actions"
+        },
+        {
+          "name": "integration invoke rejects --output for manifest v1 actions"
+        },
+        {
+          "name": "integration invoke file response preserves null content type"
+        },
+        {
+          "name": "integration invoke file response honors RFC 5987 content-disposition filename"
+        },
+        {
+          "name": "integration invoke file response falls back from hostile content-disposition filename"
+        },
+        {
+          "name": "integration invoke file response honors manifest response.filename fallback"
+        },
+        {
+          "name": "integration invoke file response reports overwrite effect"
+        },
+        {
+          "name": "integration invoke file response reports created and dir-created effects"
+        },
+        {
+          "name": "integration invoke file response surfaces local write failures"
+        },
+        {
+          "name": "integration invoke file response reports source transport reset"
+        },
+        {
+          "name": "integration invoke file response reports destination write failure"
+        },
+        {
+          "name": "integration invoke file response counts delayed destination write callbacks on source error"
+        },
+        {
+          "name": "integration invoke file response rejects zero-progress destination write"
+        },
+        {
+          "name": "integration invoke file response cleans up partial temp artifact on stream failure"
+        },
+        {
+          "name": "integration invoke file response reports retained partial write bytes on rollback cleanup failure"
+        },
+        {
+          "name": "integration invoke file response reports post-commit receipt failure"
+        },
+        {
+          "name": "integration invoke file response reports partial cleanup failure on rollback"
+        },
+        {
+          "name": "integration invoke file response rejects null body before filesystem effects"
+        },
+        {
+          "name": "integration invoke file response reports temp directory cleanup failure"
+        },
+        {
+          "name": "integration invoke file response reports cleanup failure in JSON mode"
+        },
+        {
+          "name": "integration invoke file response emits machine-readable JSON error on source reset"
+        },
+        {
+          "name": "integration invoke substitutes manifest path placeholders before POSTing JSON body"
+        },
+        {
+          "name": "integration invoke preserves release notes idempotencyKey while keeping releaseId URL-only"
+        },
+        {
+          "name": "integration invoke puts GET path-placeholder payload fields in the query only"
+        },
+        {
+          "name": "integration invoke lists manifest HTTP API actions without logging in"
+        },
+        {
+          "name": "integration invoke list-actions JSON preserves the typed source rendered by the human view"
+        },
+        {
+          "name": "integration invoke list-actions automatically renders typed action fields from the JSON source"
+        },
+        {
+          "name": "integration list-actions succeeds for an existing Web app with no manifest"
+        },
+        {
+          "name": "integration list-actions treats a missing registered manifest as non-breaking discovery"
+        },
+        {
+          "name": "integration list-actions JSON preserves unknown surface for a missing registered manifest"
+        },
+        {
+          "name": "integration list-actions JSON reports web-only only when no manifest is configured"
+        },
+        {
+          "name": "integration explicit action remains fail-closed when no manifest is configured"
+        },
+        {
+          "name": "integration invoke preserves planned-offline 503 fault domain and retry metadata"
+        },
+        {
+          "name": "integration invoke preserves Cloudflare HTML content type as non-retryable response invalid"
+        },
+        {
+          "name": "integration invoke list-actions documents non-GET id resource locator query shim"
+        },
+        {
+          "name": "integration invoke falls back from inferred Raft well-known manifest to legacy Slock path"
+        },
+        {
+          "name": "integration list-actions never initiates login for unsupported manifest auth"
+        },
+        {
+          "name": "integration list-actions target cannot turn manifest failure into login approval"
+        },
+        {
+          "name": "integration manifest failure is independent from login endpoint availability"
+        },
+        {
+          "name": "integration invoke does not prepare login request for unrelated manifest errors"
+        },
+        {
+          "name": "integration invoke performs stateless callback handoff and posts JSON action body"
+        },
+        {
+          "name": "legacy action execution reaches a proxy-only target and preserves a direct action route"
+        },
+        {
+          "name": "legacy action transport failures preserve a bounded cause without dispatch success"
+        },
+        {
+          "name": "integration invoke explains how to post an approval card when login has no target"
+        },
+        {
+          "name": "integration invoke reports the approval card prepared for its target"
+        },
+        {
+          "name": "integration invoke reuses stored service session without creating a fresh handoff request"
+        },
+        {
+          "name": "integration invoke reports a clear login next action when service rejects cached session"
+        },
+        {
+          "name": "integration invoke renders structured non-2xx status and redacted response body with or without --json"
+        },
+        {
+          "name": "integration invoke recursively redacts structured error fields even when Content-Type is text/plain"
+        },
+        {
+          "name": "integration invoke preserves a controlled typed integer-validation error instead of rendering object coercion"
+        },
+        {
+          "name": "integration invoke includes status and redacts credentials in a text error response"
+        },
+        {
+          "name": "integration invoke keeps malformed JSON-shaped plain-text errors readable"
+        },
+        {
+          "name": "integration invoke does not forward callback cookies to a different action host"
+        },
+        {
+          "name": "integration invoke honors callback cookie Path before action requests"
+        },
+        {
+          "name": "integration invoke does not forward Secure callback cookies to http action URLs"
+        },
+        {
+          "name": "integration invoke validates required manifest parameters before login"
+        },
+        {
+          "name": "integration invoke rejects v1 structured fields passed through text --param before login"
+        },
+        {
+          "name": "integration v1 list-actions JSON exposes typed actor-relative readiness without login"
+        },
+        {
+          "name": "integration v1 preflight binds the exact action and existing session without dispatch"
+        },
+        {
+          "name": "integration v1 preflight fails closed when the invoke-path manifest is unreachable"
+        },
+        {
+          "name": "the same service can list actions before invoke preflight reports a bounded refetch cause without dispatch"
+        },
+        {
+          "name": "integration v1 preflight fails closed on an invalid invoke-path manifest"
+        },
+        {
+          "name": "integration v1 preflight fails closed on action drift without login or dispatch"
+        },
+        {
+          "name": "integration v1 preflight fails closed when the stored session does not bind the exact action"
+        },
+        {
+          "name": "integration v1 preflight rejects payload and login options before any API or file read"
+        },
+        {
+          "name": "integration v1 undeclared and local CLI actions fail before login with typed JSON"
+        },
+        {
+          "name": "integration v1 validates input before Agent Login or action dispatch"
+        },
+        {
+          "name": "integration v1 read action emits a typed verified receipt without secrets"
+        },
+        {
+          "name": "CleanupOutcome cleaned factory is private to the finalizer"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/integration/invokeV1.test.ts",
+      "count": 19,
+      "cases": [
+        {
+          "name": "v1 mutation receipt is verified only after an independent readback receipt"
+        },
+        {
+          "name": "receipt target uses the durable canonical server binding"
+        },
+        {
+          "name": "key_required timeout is indeterminate and retry reuses the invocation and key"
+        },
+        {
+          "name": "5xx leaves authority unknown and output-schema failure prevents readback"
+        },
+        {
+          "name": "action response streaming stops at the byte limit before buffering the remainder"
+        },
+        {
+          "name": "input and request mapping fail before dispatch and dot segments cannot traverse"
+        },
+        {
+          "name": "a missing optional request pointer is a pre-dispatch input error"
+        },
+        {
+          "name": "manifest v1 base URL cannot move action authority to another origin"
+        },
+        {
+          "name": "bounded input depth and persistence failure both prevent dispatch"
+        },
+        {
+          "name": "a dispatching invocation cannot be retried concurrently"
+        },
+        {
+          "name": "tampered invocation identity or idempotency key digest cannot be retried"
+        },
+        {
+          "name": "post-dispatch invocation finalization failure remains typed and fail-closed"
+        },
+        {
+          "name": "effective contract digest binds every canonical target and contract dimension"
+        },
+        {
+          "name": "403 denial is tuple-relative and unsafe request ids are not emitted"
+        },
+        {
+          "name": "429 retry guidance preserves the same invocation binding"
+        },
+        {
+          "name": "non-idempotent timeout is indeterminate and cannot be retried"
+        },
+        {
+          "name": "failed readback never verifies a mutation"
+        },
+        {
+          "name": "rollback is never implicit and an explicit rollback action receives a fresh receipt"
+        },
+        {
+          "name": "missing canonical server context fails before dispatch"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/integration/list.test.ts",
+      "count": 3,
+      "cases": [
+        {
+          "name": "integration list reports only registry and login facts without external fan-out"
+        },
+        {
+          "name": "integration list JSON preserves the registry response without synthesized readiness"
+        },
+        {
+          "name": "integration list JSON projects a structured scope mutation into its machine receipt"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/integration/login.test.ts",
+      "count": 10,
+      "cases": [
+        {
+          "name": "integration login consumes one-time handoff and stores service session without exposing request id"
+        },
+        {
+          "name": "integration login json omits successful request id and reports stored session"
+        },
+        {
+          "name": "integration login remains successful for existing Web apps with no manifest"
+        },
+        {
+          "name": "integration login reports an active Raft grant separately from a failed service-session handoff"
+        },
+        {
+          "name": "integration login surfaces the service's JSON error body on a callback HTTP rejection"
+        },
+        {
+          "name": "integration login keeps a non-JSON callback error body out of the message"
+        },
+        {
+          "name": "integration login redacts the one-time handoff and credentials echoed by a JSON error"
+        },
+        {
+          "name": "integration login does not fetch manifest login_url before the stateless agent callback"
+        },
+        {
+          "name": "integration login reports install-required without calling the app callback or creating a session"
+        },
+        {
+          "name": "integration login preserves typed invalid scope failures"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/integration/manifest.test.ts",
+      "count": 22,
+      "cases": [
+        {
+          "name": "validateAgentManifestV0 accepts minimal local CLI per-agent HOME manifest"
+        },
+        {
+          "name": "validateAgentManifestV0 accepts manifests without local credential boundary"
+        },
+        {
+          "name": "validateAgentManifestV0 ignores unrelated extension fields for backward compatibility"
+        },
+        {
+          "name": "validateAgentManifestV0 accepts canonical URL schema for v0 manifests"
+        },
+        {
+          "name": "validateAgentManifestV0 accepts Raft-branded schema alias for v0 manifests"
+        },
+        {
+          "name": "validateAgentManifestV0 accepts manifests without docs_url"
+        },
+        {
+          "name": "validateAgentManifestV0 accepts login_with_raft HTTP API actions"
+        },
+        {
+          "name": "validateAgentManifestV0 accepts file response declarations on HTTP API actions"
+        },
+        {
+          "name": "validateAgentManifestV0 rejects unknown response types"
+        },
+        {
+          "name": "validateAgentManifestV0 accepts file response maxBytes"
+        },
+        {
+          "name": "validateAgentManifestV0 rejects invalid file response maxBytes"
+        },
+        {
+          "name": "validateAgentManifestV0 rejects file response declarations on local_cli actions"
+        },
+        {
+          "name": "fetchAgentManifestWithWellKnownAliases falls back from Raft to legacy Slock well-known path"
+        },
+        {
+          "name": "fetchAgentManifest attaches the canonical dispatcher for an HTTPS proxy route"
+        },
+        {
+          "name": "fetchAgentManifest preserves the actual credential-free URL and bounded HTTP cause"
+        },
+        {
+          "name": "validateAgentManifestV0 rejects unsafe or duplicate HTTP API actions"
+        },
+        {
+          "name": "validateAgentManifestV0 validates docs_url when present"
+        },
+        {
+          "name": "validateAgentManifestV0 rejects command paths and shell fragments"
+        },
+        {
+          "name": "buildLocalCliProfileEnv derives per-agent HOME and XDG state under SLOCK_HOME"
+        },
+        {
+          "name": "buildLocalCliProfileEnv keeps integration profiles under the canonical Raft home"
+        },
+        {
+          "name": "buildLocalCliProfileEnv fails closed unless manifest explicitly forbids user HOME"
+        },
+        {
+          "name": "buildLocalCliProfileEnv fails closed without per-agent HOME storage"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/integration/manifestV1.test.ts",
+      "count": 9,
+      "cases": [
+        {
+          "name": "validates and normalizes a closed manifest v1 action graph"
+        },
+        {
+          "name": "rejects remote refs and schema work beyond the bounded depth"
+        },
+        {
+          "name": "rejects request mapping gaps, GET bodies, and legacy action fields"
+        },
+        {
+          "name": "rejects authority, effect, and idempotency widening"
+        },
+        {
+          "name": "rejects invalid readback and rollback references"
+        },
+        {
+          "name": "local CLI v1 remains discovery-only and cannot carry actions or a command"
+        },
+        {
+          "name": "HTTP API base URL preserves a closed path and rejects query or fragment state"
+        },
+        {
+          "name": "malformed optional fields and unsafe regex work fail closed"
+        },
+        {
+          "name": "manifest action, scope, and binding collections are bounded"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/integration/marketplace.test.ts",
+      "count": 4,
+      "cases": [
+        {
+          "name": "integration marketplace searches public apps and gives the exact login handoff"
+        },
+        {
+          "name": "integration marketplace JSON preserves the explicit public and untrusted-metadata boundaries"
+        },
+        {
+          "name": "integration marketplace neutralizes terminal control characters in publisher text"
+        },
+        {
+          "name": "integration marketplace rejects invalid limits before making a request"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/integration/readiness.test.ts",
+      "count": 7,
+      "cases": [
+        {
+          "name": "registry observation keeps list bounded and marks configured manifests unchecked"
+        },
+        {
+          "name": "Survey-style missing manifest remains missing and never becomes web-only or valid"
+        },
+        {
+          "name": "Cloudflare HTML manifest response preserves content type and response fault domain"
+        },
+        {
+          "name": "planned-offline HTTP 503 is unavailable with verbatim Retry-After, not unreachable"
+        },
+        {
+          "name": "valid HTTP action manifest reports manifest actions with manifest-shape ceiling"
+        },
+        {
+          "name": "Web-only service without a manifest is explicit and performs no fetch"
+        },
+        {
+          "name": "unrecognized observations fail forward to unchecked unknown"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/integration/readinessV1.test.ts",
+      "count": 3,
+      "cases": [
+        {
+          "name": "web-only not-configured is an intentional actor-relative steady state"
+        },
+        {
+          "name": "valid action readiness never promotes session presence to authority"
+        },
+        {
+          "name": "local CLI v1 stays design-blocked even when a session exists"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/knowledge/get.test.ts",
+      "count": 8,
+      "cases": [
+        {
+          "name": "formatKnowledgeStdout: byte-preserves content that already ends with newline"
+        },
+        {
+          "name": "formatKnowledgeStdout: appends a trailing newline when missing"
+        },
+        {
+          "name": "formatKnowledgeStdout: does not parse, strip, or render component-shaped tokens"
+        },
+        {
+          "name": "manual get help points agents to the index topic catalog"
+        },
+        {
+          "name": "knowledge get command uses injected ApiClient and byte-preserves server content"
+        },
+        {
+          "name": "knowledge get command fails closed on malformed success"
+        },
+        {
+          "name": "knowledge get command builds a fixed cross-shell-safe not-found fallback"
+        },
+        {
+          "name": "knowledge get reports both missing context fields before loading credentials or calling the API"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/knowledge/search.test.ts",
+      "count": 9,
+      "cases": [
+        {
+          "name": "formatKnowledgeSearchResults renders slug title and first screen"
+        },
+        {
+          "name": "manual search help documents recipes scope"
+        },
+        {
+          "name": "knowledge search command uses injected ApiClient and preserves top-3 result order"
+        },
+        {
+          "name": "knowledge search command builds a fixed cross-shell-safe not-found fallback"
+        },
+        {
+          "name": "knowledge search preserves the language-unsupported code instead of collapsing it"
+        },
+        {
+          "name": "knowledge search rejects missing reason before loading credentials or calling the API"
+        },
+        {
+          "name": "knowledge search reports both invalid context fields in one recovery"
+        },
+        {
+          "name": "formatKnowledgeSearchResults states typo corrections and concept expansions"
+        },
+        {
+          "name": "formatKnowledgeSearchResults stays quiet for plain matches and old servers"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/mention/_format.test.ts",
+      "count": 11,
+      "cases": [
+        {
+          "name": "send mention partial result is referent-bound, privacy-safe, and copyable"
+        },
+        {
+          "name": "send mention partial result keeps every token bound to its own action"
+        },
+        {
+          "name": "send mention partial result warns when an authored token resolved to no visible target"
+        },
+        {
+          "name": "send partial contract rejects ordering, referent, proof, retry, and shell mutants"
+        },
+        {
+          "name": "mention parser keeps the current NFC/NFD boundary explicit"
+        },
+        {
+          "name": "sender formatter preserves a legal non-ASCII authored token byte-for-byte"
+        },
+        {
+          "name": "formatPendingMentionActions names empty pending state"
+        },
+        {
+          "name": "normalizers accept server response aliases without leaking malformed rows"
+        },
+        {
+          "name": "formatMentionActionResults renders per-id typed statuses from the server execute shape"
+        },
+        {
+          "name": "formatMentionActionResults does not claim a fresh recipient notice for replayed notify"
+        },
+        {
+          "name": "formatMentionActionResults makes dropped notify delivery failure explicit"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/mention/execute.test.ts",
+      "count": 4,
+      "cases": [
+        {
+          "name": "mention notify exits nonzero when any requested recovery was not queued"
+        },
+        {
+          "name": "mention notify succeeds only when every requested recovery is queued"
+        },
+        {
+          "name": "mention add --json exits nonzero when membership delivery is denied"
+        },
+        {
+          "name": "mention execute requires at least one resolution id"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/mention/pending.test.ts",
+      "count": 2,
+      "cases": [
+        {
+          "name": "mention pending calls pending endpoint and renders actions"
+        },
+        {
+          "name": "mention pending --json emits normalized action payload"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/message/_consumedSeqState.test.ts",
+      "count": 5,
+      "cases": [
+        {
+          "name": "consumed cursor is strictly per-target — no cross-target leakage (gate 3)"
+        },
+        {
+          "name": "consumed cursor merges monotonically per target"
+        },
+        {
+          "name": "absent or junk cursors resolve to undefined (omit → server fail-closed hold)"
+        },
+        {
+          "name": "cursors are per-agent isolated"
+        },
+        {
+          "name": "most recent thread context follows local read order, not global message seq"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/message/_format.test.ts",
+      "count": 39,
+      "cases": [
+        {
+          "name": "formatMessages: empty list"
+        },
+        {
+          "name": "formatMessages: single channel message"
+        },
+        {
+          "name": "formatMessages: notify-only outsider mention states the reply limitation"
+        },
+        {
+          "name": "formatMessages: DM with attachments"
+        },
+        {
+          "name": "formatMessages: thread message"
+        },
+        {
+          "name": "formatMessages: DM thread"
+        },
+        {
+          "name": "formatMessages: task annotation"
+        },
+        {
+          "name": "formatMessages: unresolved task assignee never prints opaque id"
+        },
+        {
+          "name": "formatMessages: amended task preserves host bytes and renders the current projection"
+        },
+        {
+          "name": "formatMessages: third-party event uses concrete agent-event target"
+        },
+        {
+          "name": "formatMessages: multiple messages preserve order"
+        },
+        {
+          "name": "formatHistory: empty channel"
+        },
+        {
+          "name": "formatHistory: basic history with last_read_seq"
+        },
+        {
+          "name": "formatHistory: has_more with default (backward) pagination"
+        },
+        {
+          "name": "formatHistory: has_more with forward pagination (after)"
+        },
+        {
+          "name": "formatHistory: around mode shows both directions"
+        },
+        {
+          "name": "formatHistory: format-only metadata never references an ack command"
+        },
+        {
+          "name": "formatHistory: task assignee uses resolved handle without opaque id"
+        },
+        {
+          "name": "formatHistory: superseded task root keeps original content and points to current text"
+        },
+        {
+          "name": "formatHistory: thread and reply count in header"
+        },
+        {
+          "name": "formatHistory: top-level channel message without thread state shows reply target"
+        },
+        {
+          "name": "formatHistory: top-level DM message with thread state shows DM reply target"
+        },
+        {
+          "name": "formatHistory: top-level DM message without thread state shows DM reply target"
+        },
+        {
+          "name": "formatHistory: thread target suppresses nested reply target"
+        },
+        {
+          "name": "formatHistory: historyLimited footer"
+        },
+        {
+          "name": "formatSearchResults: empty"
+        },
+        {
+          "name": "formatSearchResults: filtered browse without query"
+        },
+        {
+          "name": "formatSearchResults: single result in channel"
+        },
+        {
+          "name": "formatSearchResults: thread result with parent"
+        },
+        {
+          "name": "formatSearchResults: DM result"
+        },
+        {
+          "name": "formatSearchResults: amended task hit carries a neutralized current projection"
+        },
+        {
+          "name": "formatSearchResults: marks omitted boundaries around clipped preview"
+        },
+        {
+          "name": "formatSearchResults: complete short preview has no omit markers"
+        },
+        {
+          "name": "formatSearchResults: preserves markdown in preview body"
+        },
+        {
+          "name": "formatSearchResults: escapes source literals that collide with MDX components"
+        },
+        {
+          "name": "formatSearchResults: readout does not expose side-effecting mention handles"
+        },
+        {
+          "name": "formatSearchResults: neutralizes ref-shaped text at line starts inside previews"
+        },
+        {
+          "name": "formatSearchResults: neutralizes mentions after escaped component literals"
+        },
+        {
+          "name": "formatSearchResults: expands matches that would split ref-shaped literals"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/message/_inbox.test.ts",
+      "count": 7,
+      "cases": [
+        {
+          "name": "drainInbox: uses agent-api events without a separate ack call"
+        },
+        {
+          "name": "drainInbox: block opts still use non-blocking agent-api events"
+        },
+        {
+          "name": "drainInbox loops until has_more=false and returns the full backlog (task #80)"
+        },
+        {
+          "name": "drainInbox with explicit has_more=false records that the drain is complete"
+        },
+        {
+          "name": "drainInbox returns the partial set when a follow-up round fails (rest stays pending)"
+        },
+        {
+          "name": "drainInbox stops at the safety cap even if has_more never clears"
+        },
+        {
+          "name": "drainInbox returns accumulated has_more batches in seq order"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/message/_privateStateFile.test.ts",
+      "count": 5,
+      "cases": [
+        {
+          "name": "draft state is private and never follows symlinks"
+        },
+        {
+          "name": "cursor state is private and never follows symlinks"
+        },
+        {
+          "name": "draft state written by the pre-hardening layout is imported once on first read"
+        },
+        {
+          "name": "cursor state written by the pre-hardening layout is imported once on first read"
+        },
+        {
+          "name": "legacy import refuses symlinks and does not run under an explicit state directory"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/message/check.test.ts",
+      "count": 6,
+      "cases": [
+        {
+          "name": "message check command drains inbox through injected ApiClient and writes canonical text"
+        },
+        {
+          "name": "message check command renders an actionable hint when more messages may remain"
+        },
+        {
+          "name": "message check command renders a final-drain hint when one explicit batch is complete"
+        },
+        {
+          "name": "message check command renders a final-drain hint when has_more batches were fully drained"
+        },
+        {
+          "name": "message check command maps events failures into typed CliError"
+        },
+        {
+          "name": "message check command fails loud when the inbox events surface returns 5xx"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/message/react.test.ts",
+      "count": 2,
+      "cases": [
+        {
+          "name": "normalizeReactionEmoji trims a single reaction token"
+        },
+        {
+          "name": "normalizeReactionEmoji rejects empty or multi-token reactions"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/message/read.test.ts",
+      "count": 12,
+      "cases": [
+        {
+          "name": "message read command uses injected ApiClient and writes canonical history"
+        },
+        {
+          "name": "message read command records consumed boundary for ordinary history reads"
+        },
+        {
+          "name": "message read marks a transport failure as retryable without calling it an unknown write"
+        },
+        {
+          "name": "message read prints server-projected forwarded snapshots without re-parsing metadata"
+        },
+        {
+          "name": "message read command accepts legacy --channel alias during target transition"
+        },
+        {
+          "name": "message read command rejects conflicting --target and legacy --channel"
+        },
+        {
+          "name": "message read command does not advance the consumed boundary for empty history"
+        },
+        {
+          "name": "message read command preserves an existing consumed boundary when there are no newer messages"
+        },
+        {
+          "name": "message read command sends message id anchors for after and before"
+        },
+        {
+          "name": "message read command maps invalid limit into typed CliError"
+        },
+        {
+          "name": "message read command maps server failures into typed CliError"
+        },
+        {
+          "name": "message read command preserves fail-closed anchor error codes"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/message/resolve.test.ts",
+      "count": 5,
+      "cases": [
+        {
+          "name": "buildResolvePath: encodes message id on the id-less surface"
+        },
+        {
+          "name": "message resolve command prints a canonical citation row"
+        },
+        {
+          "name": "message resolve prints the server-projected forwarded snapshot verbatim"
+        },
+        {
+          "name": "message resolve command fails closed for unknown ids"
+        },
+        {
+          "name": "message resolve command does not pick an ambiguous short id"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/message/search.test.ts",
+      "count": 12,
+      "cases": [
+        {
+          "name": "message search command uses injected ApiClient and writes canonical results"
+        },
+        {
+          "name": "message search command accepts legacy --channel alias during target transition"
+        },
+        {
+          "name": "message search command supports sender-only recent timeline"
+        },
+        {
+          "name": "message search command normalizes naive filters in the CLI display timezone"
+        },
+        {
+          "name": "message search command round-trips rendered and truncated Time output as local instants"
+        },
+        {
+          "name": "message search command rejects empty searches without query or filters"
+        },
+        {
+          "name": "message search command rejects relevance sort for filter-only search"
+        },
+        {
+          "name": "message search command rejects UUID sender refs"
+        },
+        {
+          "name": "message search command maps server failures into typed CliError"
+        },
+        {
+          "name": "message search command maps HTTP 5xx into SERVER_5XX"
+        },
+        {
+          "name": "message search command preserves QUERY_TOO_BROAD as a machine-readable rejection"
+        },
+        {
+          "name": "message search command preserves SEARCH_TIMEOUT after an admitted query reaches statement timeout"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/message/send.test.ts",
+      "count": 78,
+      "cases": [
+        {
+          "name": "resolveSendContent reads multiline content from stdin"
+        },
+        {
+          "name": "typed mention selectors bind one actor type and id per visible handle"
+        },
+        {
+          "name": "resolveSendContent rejects empty stdin"
+        },
+        {
+          "name": "resolveSendContent rejects whitespace-only stdin"
+        },
+        {
+          "name": "resolveSendContent rejects TTY stdin without waiting for input"
+        },
+        {
+          "name": "resolveOptionalSendContent reads non-empty stdin"
+        },
+        {
+          "name": "resolveOptionalSendContent treats empty stdin as absent"
+        },
+        {
+          "name": "resolveOptionalSendContent preserves whitespace bytes as unsupported stdin"
+        },
+        {
+          "name": "resolveOptionalSendContent treats TTY stdin as absent without waiting"
+        },
+        {
+          "name": "resolveOptionalSendContent bounds open empty non-TTY stdin by its deadline"
+        },
+        {
+          "name": "resolveOptionalSendContent catches a real child-process pipe before the deadline"
+        },
+        {
+          "name": "resolveOptionalSendContent treats bytes after the deadline as absent"
+        },
+        {
+          "name": "resolveOptionalSendContent absorbs errors after the deadline"
+        },
+        {
+          "name": "send-draft deadline diagnostic states both the boundary and effect"
+        },
+        {
+          "name": "rejectArgContent gives friendly errors for positional content"
+        },
+        {
+          "name": "rejectArgContent gives friendly errors for the legacy --content flag"
+        },
+        {
+          "name": "validateDraftSendFlags rejects --anyway without --send-draft"
+        },
+        {
+          "name": "validateDraftSendFlags allows --anyway with --send-draft"
+        },
+        {
+          "name": "rejectSendDraftStdin fails loud and points agents to a normal send"
+        },
+        {
+          "name": "rejectSendDraftStdin allows absent stdin"
+        },
+        {
+          "name": "local draft state stores body and expires stale drafts"
+        },
+        {
+          "name": "formatHeldSendOutput frames held context as bounded latest messages"
+        },
+        {
+          "name": "reviewer-isolation formatter and JSON projector expose only the count, never legacy poison fields"
+        },
+        {
+          "name": "formatHeldSendOutput explains syncing holds as target context syncs"
+        },
+        {
+          "name": "formatHeldSendOutput teaches a Raft-specific heredoc delimiter instead of EOF"
+        },
+        {
+          "name": "formatHeldSendOutput renders canonical agent-visible message fields"
+        },
+        {
+          "name": "formatFreshnessHoldOutput can block non-message side effects without draft copy"
+        },
+        {
+          "name": "message send forwards typed mention identity on the Agent API body"
+        },
+        {
+          "name": "classifyMessageSendOutcome fails closed on unsupported send states"
+        },
+        {
+          "name": "message send failure draft wrapper preserves existing CliError fields"
+        },
+        {
+          "name": "message send received 5xx keeps the draft without masquerading as unknown commit"
+        },
+        {
+          "name": "message send transport ambiguity keeps the draft and fails closed as not retryable"
+        },
+        {
+          "name": "message send-draft received 5xx reports the retained draft as a known response"
+        },
+        {
+          "name": "freshness hold recovery sends the saved draft with open empty non-TTY stdin"
+        },
+        {
+          "name": "message send-draft re-hold exits nonzero and retains the draft without target effect"
+        },
+        {
+          "name": "message send-draft rejects a genuinely non-empty stdin pipe before sending"
+        },
+        {
+          "name": "message send-draft rejects delayed stdin bytes before the deadline with zero API calls"
+        },
+        {
+          "name": "message send-draft rejects stdin errors before the deadline with zero API calls"
+        },
+        {
+          "name": "send auto-attests the per-target consumed cursor (gate 1, client side)"
+        },
+        {
+          "name": "send trims the target before looking up the consumed cursor"
+        },
+        {
+          "name": "read→send handoff attests the returned history boundary"
+        },
+        {
+          "name": "read→send handoff isolates parent channel and thread targets"
+        },
+        {
+          "name": "thread-context parent send asks for confirmation and saves a draft without posting"
+        },
+        {
+          "name": "thread-context parent send allows explicit target confirmation without sending a draft"
+        },
+        {
+          "name": "thread-context parent send parses --target-confirmed from cron-shaped argv"
+        },
+        {
+          "name": "thread-context parent send confirmation preempts server freshness holds"
+        },
+        {
+          "name": "thread-context parent send confirmation is bypassed only by sending the saved draft"
+        },
+        {
+          "name": "thread-context parent send confirmation uses the existing single target draft slot"
+        },
+        {
+          "name": "thread-context parent send confirmation warns before replacing an existing draft"
+        },
+        {
+          "name": "thread-context parent send guard stays narrow around stale or exact thread targets"
+        },
+        {
+          "name": "thread-context parent send guard clears after an explicit parent read with a lower seq"
+        },
+        {
+          "name": "thread-context parent send guard migrates legacy numeric state without treating seq as chronology"
+        },
+        {
+          "name": "thread-context parent send guard chooses the last-read sibling thread, not the highest-seq thread"
+        },
+        {
+          "name": "thread-context parent send guard clears after an explicit empty parent read"
+        },
+        {
+          "name": "thread-context parent send message states the intentional top-level escape"
+        },
+        {
+          "name": "send never borrows a different target's cursor (gate 3, client side)"
+        },
+        {
+          "name": "hold-issued draft boundary takes priority over the local cursor (gate 4)"
+        },
+        {
+          "name": "check→send does not auto-attest sparse event-drain seqs for DM or thread targets"
+        },
+        {
+          "name": "send renders pending mention actions only on sent responses"
+        },
+        {
+          "name": "send-draft mention partial reports queued effect and no retained draft"
+        },
+        {
+          "name": "send warns when an authored mention resolved to no visible target"
+        },
+        {
+          "name": "send --json exposes layered message and mention effects without an extra warning stream"
+        },
+        {
+          "name": "send --json mention partial renders one queued-effect error envelope"
+        },
+        {
+          "name": "send --json exposes unresolved mention warnings as a partial result"
+        },
+        {
+          "name": "send renders recent-join first-post mute tip on sent responses"
+        },
+        {
+          "name": "formatDriveByJoinedToPostTip falls back to target mute command"
+        },
+        {
+          "name": "freshness held sends save a draft and exit nonzero without target effect"
+        },
+        {
+          "name": "held send output does not render pending mention action fields"
+        },
+        {
+          "name": "reviewer-isolation send reprojects a poisoned legacy hold and preserves the prior model-seen boundary"
+        },
+        {
+          "name": "reviewer-isolation JSON send uses the strict allowlist against a poisoned legacy hold"
+        },
+        {
+          "name": "held JSON send renders one error envelope with redacted held context"
+        },
+        {
+          "name": "reviewer-isolation send error output never forwards upstream poison text"
+        },
+        {
+          "name": "replacing a non-empty draft names the target and prints the discarded body"
+        },
+        {
+          "name": "the warning does not offer --send-draft, which would send the replacement"
+        },
+        {
+          "name": "a long discarded draft is truncated but reports its true length"
+        },
+        {
+          "name": "a short draft is printed whole, with no truncation notice"
+        },
+        {
+          "name": "5xx guidance never lets reading authorise a resend"
+        },
+        {
+          "name": "5xx guidance is only attached when a draft was actually saved"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/migrate/index.test.ts",
+      "count": 6,
+      "cases": [
+        {
+          "name": "migrate import rejects agent-initiated migration before calling the API"
+        },
+        {
+          "name": "migrate status prints an empty active migration state"
+        },
+        {
+          "name": "migrate ready hashes a readable manifest and submits the callback"
+        },
+        {
+          "name": "migrate export rejects action-card preparation before calling the API"
+        },
+        {
+          "name": "migrate export does not surface server-suggested grant-control next actions"
+        },
+        {
+          "name": "agent-visible migration help and manual do not expose harness grant-control seam"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/profile/_format.test.ts",
+      "count": 2,
+      "cases": [
+        {
+          "name": "formatProfile renders agent computer context prominently"
+        },
+        {
+          "name": "formatProfile renders human created agents section"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/profile/show.test.ts",
+      "count": 4,
+      "cases": [
+        {
+          "name": "profile show command uses injected ApiClient and writes canonical text"
+        },
+        {
+          "name": "profile show command preserves legacy JSON output"
+        },
+        {
+          "name": "profile show command maps invalid targets into typed CliError"
+        },
+        {
+          "name": "profile show command maps server failures into typed CliError"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/reminder/_format.test.ts",
+      "count": 15,
+      "cases": [
+        {
+          "name": "formatReminder: scheduled without msgRef"
+        },
+        {
+          "name": "formatReminder: scheduled with msgRef"
+        },
+        {
+          "name": "formatReminder: fired status"
+        },
+        {
+          "name": "formatReminder: recurring reminder renders repeat suffix"
+        },
+        {
+          "name": "formatReminder: recurring with msgRef renders both"
+        },
+        {
+          "name": "formatReminderScheduled: without warning"
+        },
+        {
+          "name": "formatReminderScheduled: with warning"
+        },
+        {
+          "name": "formatReminderList: empty"
+        },
+        {
+          "name": "formatReminderList: multiple"
+        },
+        {
+          "name": "formatReminderCanceled"
+        },
+        {
+          "name": "formatReminder: a scheduled row whose next has passed is marked OVERDUE"
+        },
+        {
+          "name": "formatReminder: the same row before its next is not marked"
+        },
+        {
+          "name": "formatReminder: terminal rows are never marked, however old"
+        },
+        {
+          "name": "formatReminder: an unparseable fireAt is not silently reported as on time"
+        },
+        {
+          "name": "formatReminderList: marks only the overdue rows in a mixed list"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/reminder/ack.test.ts",
+      "count": 8,
+      "cases": [
+        {
+          "name": "ack retires the exact active fired item, including legacy persisted reminder item shape"
+        },
+        {
+          "name": "dismiss command shares the same exact fired-item acknowledgement path"
+        },
+        {
+          "name": "repeat ack is idempotent only with an exact durable acknowledged-source tombstone"
+        },
+        {
+          "name": "ack 404 after a stale snapshot only succeeds with a refreshed exact tombstone"
+        },
+        {
+          "name": "ack 404 after a stale snapshot fails closed without a refreshed exact tombstone"
+        },
+        {
+          "name": "ack does not treat absence as idempotency without an exact tombstone"
+        },
+        {
+          "name": "ack of N fails closed after the same reminder advances to active N+1"
+        },
+        {
+          "name": "ack rejects a short id that is ambiguous across active or acknowledged reminder sources"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/reminder/log.test.ts",
+      "count": 2,
+      "cases": [
+        {
+          "name": "historical reminder short action reads the full source without acknowledging local due item"
+        },
+        {
+          "name": "failed reminder log read never checks or acknowledges local Inbox"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/reminder/schedule.test.ts",
+      "count": 13,
+      "cases": [
+        {
+          "name": "buildScheduleBody requires delay-seconds, fire-at, or repeat"
+        },
+        {
+          "name": "buildScheduleBody rejects both delay-seconds and fire-at together"
+        },
+        {
+          "name": "buildScheduleBody rejects non-positive delay-seconds"
+        },
+        {
+          "name": "buildScheduleBody rejects missing msgId for agent-created reminders"
+        },
+        {
+          "name": "buildScheduleBody keeps an explicit msgId anchor"
+        },
+        {
+          "name": "buildScheduleBody keeps a canonical messageId anchor"
+        },
+        {
+          "name": "buildScheduleBody accepts matching legacy and canonical message anchors"
+        },
+        {
+          "name": "buildScheduleBody rejects conflicting legacy and canonical message anchors"
+        },
+        {
+          "name": "buildScheduleBody keeps an explicit channel override when msgId is present"
+        },
+        {
+          "name": "buildScheduleBody: --repeat snapshots tz from the injected now() helper"
+        },
+        {
+          "name": "buildScheduleBody: explicit --tz overrides a different host timezone"
+        },
+        {
+          "name": "buildScheduleBody: --tz requires repeat and rejects invalid IANA timezone"
+        },
+        {
+          "name": "buildScheduleBody: fire-at passes through unchanged"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/reviewerIsolation.test.ts",
+      "count": 2,
+      "cases": [
+        {
+          "name": "reviewer isolation is per invocation or explicit seat environment, defaulting off"
+        },
+        {
+          "name": "reviewer isolation fails closed on an invalid seat environment value"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/server/_format.test.ts",
+      "count": 4,
+      "cases": [
+        {
+          "name": "formatServerInfo: full server with channels, agents, humans"
+        },
+        {
+          "name": "formatChannelMembers: full channel member list"
+        },
+        {
+          "name": "formatChannelMembers: empty members"
+        },
+        {
+          "name": "formatServerInfo: empty server"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/server/info.test.ts",
+      "count": 7,
+      "cases": [
+        {
+          "name": "server info command uses injected ApiClient and env workspace fallback"
+        },
+        {
+          "name": "server info command defaults to bounded summary and preserves full dump behind --full"
+        },
+        {
+          "name": "server info --channels filters joined rows and prints paging command"
+        },
+        {
+          "name": "server info rejects --full combined with section filters before auth bootstrap"
+        },
+        {
+          "name": "server info rejects list modifiers without a selected list section before auth bootstrap"
+        },
+        {
+          "name": "server info command maps server failures into typed CliError"
+        },
+        {
+          "name": "server info command preserves shared proxy diagnostics from the central Agent API seam"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/server/update.test.ts",
+      "count": 4,
+      "cases": [
+        {
+          "name": "server update output reports updated server name"
+        },
+        {
+          "name": "server update command patches normalized name"
+        },
+        {
+          "name": "server update command requires at least one update"
+        },
+        {
+          "name": "server update avatar multipart direct route preserves proxy diagnostics centrally"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/task/_format.test.ts",
+      "count": 25,
+      "cases": [
+        {
+          "name": "formatTaskList: empty with no filter"
+        },
+        {
+          "name": "formatTaskList: empty with status filter"
+        },
+        {
+          "name": "formatTaskList: single task with assignee and creator"
+        },
+        {
+          "name": "formatTaskList: departed creator is distinct while an active creator stays unchanged"
+        },
+        {
+          "name": "formatMyTaskList: departed creator state remains visible in the cross-channel view"
+        },
+        {
+          "name": "formatTaskList: resource receipt state is visible"
+        },
+        {
+          "name": "formatTaskList: multiple tasks with mixed states"
+        },
+        {
+          "name": "formatTaskList: unresolved claimed assignee never prints opaque id"
+        },
+        {
+          "name": "formatTaskList: legacy task"
+        },
+        {
+          "name": "formatTaskList: task without messageId"
+        },
+        {
+          "name": "formatTasksCreated: batch create"
+        },
+        {
+          "name": "formatTasksCreated: unresolved assignee never prints opaque id"
+        },
+        {
+          "name": "formatClaimResults: mixed success and failure"
+        },
+        {
+          "name": "formatClaimConflict: effect-boundary receipt renders from structured fields"
+        },
+        {
+          "name": "formatClaimConflict: copy is projected, not hardcoded — field changes change copy"
+        },
+        {
+          "name": "formatClaimConflict: placement — restriction, non-ruling, and remedy are one contiguous block"
+        },
+        {
+          "name": "formatClaimConflict: unresolved assignee never fabricates a handle"
+        },
+        {
+          "name": "formatClaimResults: all success"
+        },
+        {
+          "name": "formatClaimResults: DM hints use CLI-addressable target syntax"
+        },
+        {
+          "name": "formatClaimResults: self-claim failure omits owner/admin redirect guidance"
+        },
+        {
+          "name": "formatTaskUnclaimed"
+        },
+        {
+          "name": "formatTaskStatusUpdated"
+        },
+        {
+          "name": "formatTaskList: renders created/updated as explicit UTC"
+        },
+        {
+          "name": "formatTaskList: omits the stamps entirely when absent"
+        },
+        {
+          "name": "formatMyTaskList: the cross-channel view carries the same stamps"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/task/amend.test.ts",
+      "count": 3,
+      "cases": [
+        {
+          "name": "task amend sends explicit fields and renders the durable revision/event receipt"
+        },
+        {
+          "name": "task amend supports explicit description clearing and rejects empty/ambiguous patches"
+        },
+        {
+          "name": "reviewer-isolation task amend requests withheld freshness context"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/task/assign.test.ts",
+      "count": 6,
+      "cases": [
+        {
+          "name": "task assign sends the handle and writes canonical text"
+        },
+        {
+          "name": "a bare handle without @ is normalized rather than rejected"
+        },
+        {
+          "name": "--expected-revision is forwarded only when supplied"
+        },
+        {
+          "name": "a missing assignee is refused before auth bootstrap, and points at `unassign`"
+        },
+        {
+          "name": "invalid numbers and revisions map to typed CliError"
+        },
+        {
+          "name": "server failures map to a typed CliError, 5xx distinctly"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/task/claim.test.ts",
+      "count": 7,
+      "cases": [
+        {
+          "name": "task claim command keeps repeated task numbers as one batched claim request"
+        },
+        {
+          "name": "reviewer-isolation task claim uses withheld mode and reprojects poisoned legacy hold output"
+        },
+        {
+          "name": "task claim exit status: zero successes is non-zero, any success is zero"
+        },
+        {
+          "name": "zero-success claim with a structured conflict throws typed CLAIM_CONFLICT naming the holder"
+        },
+        {
+          "name": "zero-success claim without a conflict throws typed CLAIM_FAILED carrying the reason"
+        },
+        {
+          "name": "already-claimed-by-you still authorises work: no throw, exit stays clean"
+        },
+        {
+          "name": "a partial claim (one success, one conflict) does not throw"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/task/convert.test.ts",
+      "count": 4,
+      "cases": [
+        {
+          "name": "task convert command uses injected ApiClient and writes canonical text"
+        },
+        {
+          "name": "task convert command requires a message id"
+        },
+        {
+          "name": "task convert maps an already-converted conflict into a typed CliError"
+        },
+        {
+          "name": "task convert maps a 5xx to SERVER_5XX rather than CONVERT_FAILED"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/task/create.test.ts",
+      "count": 7,
+      "cases": [
+        {
+          "name": "task create command uses injected ApiClient and writes canonical text"
+        },
+        {
+          "name": "task create sends one atomic create-and-assign request"
+        },
+        {
+          "name": "task create help advertises atomic assignee semantics"
+        },
+        {
+          "name": "task create marks every batch item as resource-creating"
+        },
+        {
+          "name": "task create rejects a non-handle assignee before auth bootstrap"
+        },
+        {
+          "name": "task create command maps missing titles into typed CliError"
+        },
+        {
+          "name": "task create command maps server failures into typed CliError"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/task/delete.test.ts",
+      "count": 4,
+      "cases": [
+        {
+          "name": "task delete command uses injected ApiClient and writes canonical text"
+        },
+        {
+          "name": "task delete command maps invalid numbers into typed CliError"
+        },
+        {
+          "name": "task delete surfaces who may delete when the server refuses with 403"
+        },
+        {
+          "name": "task delete maps a 5xx to SERVER_5XX rather than DELETE_FAILED"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/task/history.test.ts",
+      "count": 1,
+      "cases": [
+        {
+          "name": "task history reads the exact task and renders ordered actor-bound audit events"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/task/list.test.ts",
+      "count": 6,
+      "cases": [
+        {
+          "name": "task list command uses injected ApiClient and writes canonical text"
+        },
+        {
+          "name": "task list --mine requests the bound-agent scope and renders grouped complete output"
+        },
+        {
+          "name": "task list --mine rejects a channel selector"
+        },
+        {
+          "name": "task list --mine distinguishes an empty covered scope from a failed read"
+        },
+        {
+          "name": "task list command maps invalid status into typed CliError"
+        },
+        {
+          "name": "task list command maps server failures into typed CliError"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/task/mineManualContract.test.ts",
+      "count": 4,
+      "cases": [
+        {
+          "name": "the manual quotes the heading the renderer actually prints"
+        },
+        {
+          "name": "the manual documents server scope, not just channel scope"
+        },
+        {
+          "name": "an absent pagination block renders unknown, and the manual says unknown is not false"
+        },
+        {
+          "name": "showing X of X is the same count twice, and the manual says so"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/task/receipt.test.ts",
+      "count": 2,
+      "cases": [
+        {
+          "name": "task receipt sends all seven fields and renders owner/anchor receipt"
+        },
+        {
+          "name": "task receipt rejects blank fields before auth bootstrap"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/task/unassign.test.ts",
+      "count": 4,
+      "cases": [
+        {
+          "name": "task unassign sends an explicit null assignee and writes canonical text"
+        },
+        {
+          "name": "task unassign forwards --expected-revision only when supplied"
+        },
+        {
+          "name": "task unassign takes no assignee flag — clearing is the whole verb"
+        },
+        {
+          "name": "task unassign maps invalid numbers and revisions to typed CliError"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/task/unclaim.test.ts",
+      "count": 3,
+      "cases": [
+        {
+          "name": "task unclaim command uses injected ApiClient and writes canonical text"
+        },
+        {
+          "name": "task unclaim command maps invalid numbers into typed CliError"
+        },
+        {
+          "name": "task unclaim command maps server failures into typed CliError"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/task/update.test.ts",
+      "count": 8,
+      "cases": [
+        {
+          "name": "task update command uses injected ApiClient and writes canonical text"
+        },
+        {
+          "name": "task update command preserves freshness-hold output"
+        },
+        {
+          "name": "reviewer-isolation task update sends withheld mode and never renders poisoned hold metadata"
+        },
+        {
+          "name": "task update command maps invalid status into typed CliError"
+        },
+        {
+          "name": "task update command rejects repeated task numbers before loading credentials"
+        },
+        {
+          "name": "task update parser rejects repeated --number instead of silently using the last value"
+        },
+        {
+          "name": "task update command rejects missing task number before loading credentials"
+        },
+        {
+          "name": "task update command maps server failures into typed CliError"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/thread/unfollow.test.ts",
+      "count": 5,
+      "cases": [
+        {
+          "name": "parseThreadTarget accepts explicit thread targets and UUIDs"
+        },
+        {
+          "name": "parseThreadTarget rejects non-thread targets"
+        },
+        {
+          "name": "unfollow thread output explains delivery semantics"
+        },
+        {
+          "name": "unfollow thread command uses injected ApiClient and writes result"
+        },
+        {
+          "name": "unfollow thread command maps invalid target into typed CliError"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/user/info.test.ts",
+      "count": 3,
+      "cases": [
+        {
+          "name": "user info command shows visible agent facts and channel memberships"
+        },
+        {
+          "name": "user info command supports bounded channel inspection"
+        },
+        {
+          "name": "user info maps missing users to typed error with next action"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/version.test.ts",
+      "count": 7,
+      "cases": [
+        {
+          "name": "version asks the live daemon and ignores stale inherited process env"
+        },
+        {
+          "name": "version JSON labels the observation as live daemon process"
+        },
+        {
+          "name": "live observation marker is required by the production parser"
+        },
+        {
+          "name": "version fails closed when the live daemon cannot answer"
+        },
+        {
+          "name": "version rejects placeholder live metadata {\"daemonVersion\":\"0.0.0\",\"computerVersion\":null}"
+        },
+        {
+          "name": "version rejects placeholder live metadata {\"daemonVersion\":\"1.0.15\",\"computerVersion\":\"0.0.0-dev\"}"
+        },
+        {
+          "name": "invalid live daemon metadata never falls back to inherited daemon env"
+        }
+      ]
+    },
+    {
+      "file": "src/commands/wiki/index.test.ts",
+      "count": 5,
+      "cases": [
+        {
+          "name": "wiki manifest prints the canonical manifest envelope as JSON"
+        },
+        {
+          "name": "wiki read fetches the current canonical artifact envelope as JSON"
+        },
+        {
+          "name": "wiki read rejects a missing or invalid artifact id before auth or network"
+        },
+        {
+          "name": "wiki publish reads one JSON payload file and returns the committed envelope"
+        },
+        {
+          "name": "wiki publish fails before auth or network when the input file is invalid"
+        }
+      ]
+    },
+    {
+      "file": "src/core/browserHandoff.test.ts",
+      "count": 2,
+      "cases": [
+        {
+          "name": "installEnterToOpenUrl opens the URL on Enter and only once"
+        },
+        {
+          "name": "canInstallEnterToOpenUrl requires TTY stdin"
+        }
+      ]
+    },
+    {
+      "file": "src/core/command.test.ts",
+      "count": 10,
+      "cases": [
+        {
+          "name": "registered command receives injected context and writes through injected io"
+        },
+        {
+          "name": "registered command renders CliError as canonical text stderr"
+        },
+        {
+          "name": "registered command renders optional draft-saved visibility line"
+        },
+        {
+          "name": "registered command renders stable effect and retryability fields"
+        },
+        {
+          "name": "registered command renders optional proxy diagnostics"
+        },
+        {
+          "name": "registered command JSON errors preserve proxy diagnostics and details together"
+        },
+        {
+          "name": "registered command renders explicit distinct fault domain alongside layer"
+        },
+        {
+          "name": "registered command renders bootstrap errors with recovery text"
+        },
+        {
+          "name": "registered command supports repeatable option parsers"
+        },
+        {
+          "name": "a handler-thrown CliExit passes through without an INTERNAL_BUG rendering (task #60)"
+        }
+      ]
+    },
+    {
+      "file": "src/daemonApiPath.test.ts",
+      "count": 3,
+      "cases": [
+        {
+          "name": "daemon API CLI errors include sanitized contract rejection localization"
+        },
+        {
+          "name": "daemon API CLI errors classify invalid JSON syntax without raw body"
+        },
+        {
+          "name": "daemon API CLI treats unparsed successful daemon responses as syntax diagnostics"
+        }
+      ]
+    },
+    {
+      "file": "src/external/raftChannelWakeAdapter.test.ts",
+      "count": 5,
+      "cases": [
+        {
+          "name": "Claude Code wake manifest declares spawn-core external harness plugin"
+        },
+        {
+          "name": "Claude Code adapter emits wake_injected proof without cursor authority"
+        },
+        {
+          "name": "Claude Code adapter failed wake preserves attempt identity and nullable runtime session"
+        },
+        {
+          "name": "Claude Code channel wake adapter posts to plugin endpoint and emits wake_injected"
+        },
+        {
+          "name": "Claude Code channel wake adapter degrades when endpoint is missing or busy"
+        }
+      ]
+    },
+    {
+      "file": "src/parserOutput.test.ts",
+      "count": 10,
+      "cases": [
+        {
+          "name": "root help exact output"
+        },
+        {
+          "name": "app config help exact output"
+        },
+        {
+          "name": "root --version identifies the CLI carrier and never emits a placeholder"
+        },
+        {
+          "name": "parser harness isolates the repository CLI from an inherited managed transport"
+        },
+        {
+          "name": "manual help exact output"
+        },
+        {
+          "name": "manual get help exact output"
+        },
+        {
+          "name": "manual search help exact output"
+        },
+        {
+          "name": "missing parser argument exact stderr"
+        },
+        {
+          "name": "unknown parser command exact stderr"
+        },
+        {
+          "name": "unknown parser option exact stderr"
+        }
+      ]
+    },
+    {
+      "file": "src/printSeam.test.ts",
+      "count": 3,
+      "cases": [
+        {
+          "name": "gate-2b: no direct stdout/stderr/console writes beyond the pinned stragglers"
+        },
+        {
+          "name": "gate-2c: axSurface definitions live only in _format.ts modules"
+        },
+        {
+          "name": "byte-neutral positive control: writeText with NL reproduces the old template bytes"
+        }
+      ]
+    },
+    {
+      "file": "src/proxy.test.ts",
+      "count": 2,
+      "cases": [
+        {
+          "name": "canonical fetch reaches a proxy-only target and preserves a direct no-proxy route"
+        },
+        {
+          "name": "canonical fetch diagnostics keep bounded cause classes and redact URL credentials"
+        }
+      ]
+    },
+    {
+      "file": "src/publishPackage.test.ts",
+      "count": 2,
+      "cases": [
+        {
+          "name": "published raft package declares the supported Node engine floor"
+        },
+        {
+          "name": "dist package writer emits package metadata and executable wrappers with runtime preflight"
+        }
+      ]
+    },
+    {
+      "file": "src/runtimePreflight.test.ts",
+      "count": 6,
+      "cases": [
+        {
+          "name": "parseNodeMajor accepts normal Node version strings"
+        },
+        {
+          "name": "unsupported Node 18 exits before CLI runtime dependencies load"
+        },
+        {
+          "name": "supported Node 20+ continues without writing or exiting"
+        },
+        {
+          "name": "runtime copy tracks the published CLI Node contract and repository pin"
+        },
+        {
+          "name": "bootstrap runs preflight before dynamically importing the CLI implementation"
+        },
+        {
+          "name": "bootstrap reports a main-module load failure and exits nonzero"
+        }
+      ]
+    },
+    {
+      "file": "src/shimPackage.test.ts",
+      "count": 2,
+      "cases": [
+        {
+          "name": "shim package keeps the legacy name, slock bin, and a single raft dependency"
+        },
+        {
+          "name": "shim bin delegates to the raft slock entry and survives notice failures"
+        }
+      ]
+    },
+    {
+      "file": "src/transportTrace.routeFamily.test.ts",
+      "count": 3,
+      "cases": [
+        {
+          "name": "routeFamilyForPath classifies attachment comments ahead of generic attachment families"
+        },
+        {
+          "name": "routeFamilyForPath classifies agent-api activity ingest"
+        },
+        {
+          "name": "routeFamilyForPath classifies direct attachment upload control-plane calls"
+        }
+      ]
+    },
+    {
+      "file": "src/version.test.ts",
+      "count": 4,
+      "cases": [
+        {
+          "name": "readCliVersion reads the source package version and ignores runtime version env"
+        },
+        {
+          "name": "readCliVersion prefers the bundled dist package metadata"
+        },
+        {
+          "name": "readCliVersion accepts an injected SEA build constant without package metadata"
+        },
+        {
+          "name": "readCliVersion never returns placeholder metadata"
+        }
+      ]
+    }
+  ]
+}

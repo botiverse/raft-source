@@ -1,0 +1,59 @@
+{
+  "fixtures": [
+    {
+      "operation": "create",
+      "status": 400,
+      "body": {
+        "code": "UPLOAD_TOO_LARGE",
+        "message": "A 413 code must not be accepted by the 400 schema.",
+        "retryable": false
+      }
+    },
+    {
+      "operation": "create",
+      "status": 429,
+      "body": {
+        "code": "UPLOAD_RATE_LIMITED",
+        "message": "A rate limit is retryable.",
+        "retryable": false,
+        "retryAfterMs": 1000
+      }
+    },
+    {
+      "operation": "complete",
+      "status": 404,
+      "body": {
+        "code": "UPLOAD_OBJECT_NOT_FOUND",
+        "message": "A retryable error must include retryAfterMs.",
+        "retryable": true
+      }
+    },
+    {
+      "operation": "complete",
+      "status": 422,
+      "body": {
+        "code": "UPLOAD_OBJECT_MISMATCH",
+        "message": "A verification mismatch is not retryable.",
+        "retryable": true
+      }
+    },
+    {
+      "operation": "cancel",
+      "status": 410,
+      "body": {
+        "code": "UPLOAD_SESSION_EXPIRED",
+        "message": "Cancel does not declare a 410 response.",
+        "retryable": false
+      }
+    },
+    {
+      "operation": "status",
+      "status": 404,
+      "body": {
+        "code": "UPLOAD_FORBIDDEN",
+        "message": "A 403 code must not be accepted by the 404 schema.",
+        "retryable": false
+      }
+    }
+  ]
+}

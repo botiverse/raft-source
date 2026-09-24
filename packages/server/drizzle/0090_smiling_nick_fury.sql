@@ -1,0 +1,2 @@
+ALTER TABLE "server_members" ADD COLUMN "onboarding_wizard_current_step" text;--> statement-breakpoint
+ALTER TABLE "server_members" ADD CONSTRAINT "server_members_onboarding_wizard_current_step_valid" CHECK ("server_members"."onboarding_wizard_current_step" IS NULL OR "server_members"."onboarding_wizard_current_step" IN ('add-computer', 'create-agent', 'referral-source', 'invite-teammates', 'join-community', 'enable-notifications', 'complete'));

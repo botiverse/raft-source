@@ -1,0 +1,1 @@
+ALTER TABLE "thread_follows" ADD COLUMN "unfollowed_at" timestamp with time zone;

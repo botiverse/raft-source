@@ -1,0 +1,1226 @@
+[
+  {
+    "path": "src/analytics/flagRegistry.ts",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "\"Chat grid layout\"",
+    "count": 1,
+    "classification": "internal_dev",
+    "reason": "Experiment display name shown only in Dev tools flag overrides."
+  },
+  {
+    "path": "src/analytics/flagRegistry.ts",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "\"Sync-core messages\"",
+    "count": 1,
+    "classification": "internal_dev",
+    "reason": "Experiment display name shown only in Dev tools flag overrides."
+  },
+  {
+    "path": "src/App.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "\"Copied\"",
+    "count": 1,
+    "classification": "internal_dev",
+    "reason": "Brief feedback after copying a seed command in the raftdev Dev tools panel."
+  },
+  {
+    "path": "src/App.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "\"Not signed in\"",
+    "count": 1,
+    "classification": "internal_dev",
+    "reason": "Dev tools panel status when no local session is signed in."
+  },
+  {
+    "path": "src/App.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "\"slockdev\"",
+    "count": 1,
+    "classification": "internal_dev",
+    "reason": "Default raftdev environment label when the preview env name is missing."
+  },
+  {
+    "path": "src/App.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "Auto",
+    "count": 1,
+    "classification": "internal_dev",
+    "reason": "Dev tools feature-flag override option meaning follow PostHog/default."
+  },
+  {
+    "path": "src/App.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "Clear Local Session",
+    "count": 1,
+    "classification": "internal_dev",
+    "reason": "Dev tools control that clears local tokens/session for debugging."
+  },
+  {
+    "path": "src/App.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "Dev login",
+    "count": 1,
+    "classification": "internal_dev",
+    "reason": "Dev tools one-click seed-account login button."
+  },
+  {
+    "path": "src/App.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "Feature flags",
+    "count": 1,
+    "classification": "internal_dev",
+    "reason": "Heading for the local feature-flag override section in Dev tools."
+  },
+  {
+    "path": "src/App.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "Log out",
+    "count": 1,
+    "classification": "internal_dev",
+    "reason": "Logout control that exists only on the SlockdevDebugPanel."
+  },
+  {
+    "path": "src/App.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "Preview description",
+    "count": 1,
+    "classification": "internal_dev",
+    "reason": "Summary label for expanding the preview-environment description in Dev tools."
+  },
+  {
+    "path": "src/App.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "Reload",
+    "count": 1,
+    "classification": "internal_dev",
+    "reason": "Dev tools control that force-reloads the page."
+  },
+  {
+    "path": "src/App.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "Server Picker",
+    "count": 1,
+    "classification": "internal_dev",
+    "reason": "Dev tools entry that clears last-server and returns to the picker."
+  },
+  {
+    "path": "src/components/actions/ActionCard.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "@",
+    "count": 2,
+    "classification": "protocol",
+    "reason": "Protocol prefix for @handle agent refs in ActionCard details."
+  },
+  {
+    "path": "src/components/actions/ActionCard.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "#",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "Protocol prefix for #channel refs in ActionCard details."
+  },
+  {
+    "path": "src/components/agent/AgentDetailPanel.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "@",
+    "count": 2,
+    "classification": "protocol",
+    "reason": "Protocol @ prefix before creator and agent handles in the agent detail panel."
+  },
+  {
+    "path": "src/components/agent/AgentDetailPanel.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "`@${agent.name}`",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "Agent detail title/body shows the agent as an @name protocol handle."
+  },
+  {
+    "path": "src/components/agent/AgentDMConversationList.tsx",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "`@${item.peerName}`",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "Agent DM list subtitle shows the peer as an @handle protocol form."
+  },
+  {
+    "path": "src/components/agent/ChannelMembers.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "\"99+\"",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "User-visible 99+ overflow notation when totalParticipants exceeds 99 in the ChannelMembers header."
+  },
+  {
+    "path": "src/components/agent/LegacyChannelMembers.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "\"99+\"",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "Flag-off compatibility keeps the same user-visible 99+ participant overflow notation."
+  },
+  {
+    "path": "src/components/auth/AccountIdentitySetupPage.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "@",
+    "count": 2,
+    "classification": "protocol",
+    "reason": "Protocol @ symbol used as handle prefix and preview affordance on identity setup."
+  },
+  {
+    "path": "src/components/auth/AccountIdentitySetupPage.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "M",
+    "count": 1,
+    "classification": "user_data_example",
+    "reason": "Simulated sender avatar initial M in the identity preview; fixture identity, not product UI copy."
+  },
+  {
+    "path": "src/components/auth/ServerCreatePreview.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "#",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "Protocol # prefix on preview sidebar channel rows while creating a server."
+  },
+  {
+    "path": "src/components/auth/ServerCreatePreview.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "all",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "Preview shows the real channel name that will be created (#all); keep the channel name literal."
+  },
+  {
+    "path": "src/components/channel/EditChannelDialog.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "#",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "Protocol #channelName prefix in the edit-channel drawer description."
+  },
+  {
+    "path": "src/components/channel/LegacyEditChannelDialog.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "#",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "Flag-off compatibility keeps the protocol #channelName prefix in the settings drawer description."
+  },
+  {
+    "path": "src/components/layout/MainLayout.tsx",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "`@${agent?.displayName || agent?.name || id}`",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "Agent panel title uses @displayName protocol handle form."
+  },
+  {
+    "path": "src/components/layout/MainLayout.tsx",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "`@${dm?.peerDisplayName || dm?.peerName || dm?.name || id}`",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "DM panel title uses @peerName protocol handle form."
+  },
+  {
+    "path": "src/components/layout/MainLayout.tsx",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "`@${id}`",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "Human panel uses @id as protocol-style title when display name is missing."
+  },
+  {
+    "path": "src/components/layout/MainLayout.tsx",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "`#${channel.name}`",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "Channel panel title uses #channel protocol ref form."
+  },
+  {
+    "path": "src/components/layout/MainLayout.tsx",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "`#${fallbackChannel.name}`",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "Fallback channel panel title uses #name protocol form when the route does not match."
+  },
+  {
+    "path": "src/components/layout/MainLayout.tsx",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "`#${id}`",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "Protocol-style #id fallback title when a channel name is unresolved."
+  },
+  {
+    "path": "src/components/layout/MainLayout.tsx",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "`#${item.parentChannelName}`",
+    "count": 2,
+    "classification": "protocol",
+    "reason": "Thread panel subtitle uses #parentChannelName protocol ref."
+  },
+  {
+    "path": "src/components/layout/MainLayout.tsx",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "`${entry.channelType === \"dm\" ? \"@\" : \"#\"}${entry.channelName}`",
+    "count": 2,
+    "classification": "protocol",
+    "reason": "Saved-entry panel title uses @/# protocol prefix by DM vs channel."
+  },
+  {
+    "path": "src/components/layout/MainLayout.tsx",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "`${item.channelType === \"dm\" ? \"@\" : \"#\"}${item.channelName}`",
+    "count": 2,
+    "classification": "protocol",
+    "reason": "Activity/inbox panel title uses @/# protocol prefix by channel type."
+  },
+  {
+    "path": "src/components/layout/MainLayout.tsx",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "`task #${task.taskNumber}`",
+    "count": 2,
+    "classification": "protocol",
+    "reason": "Task panel title uses the product task #N reference protocol."
+  },
+  {
+    "path": "src/components/layout/Sidebar.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "\"99+\"",
+    "count": 5,
+    "classification": "protocol",
+    "reason": "User-visible unread overflow protocol (unread>99 ? \"99+\"); fixed badge notation, not technical."
+  },
+  {
+    "path": "src/components/layout/Sidebar.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "→ v",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "User-visible Computer upgrade marker → v{version} in the production sidebar."
+  },
+  {
+    "path": "src/components/layout/Sidebar.tsx",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "`@${agent?.displayName || agent?.name || agentId}`",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "Opening an agent panel from the sidebar uses @handle protocol title form."
+  },
+  {
+    "path": "src/components/layout/Sidebar.tsx",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "`@${agent.displayName || agent.name}`",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "Sidebar agent-row drag panel title uses @name protocol form."
+  },
+  {
+    "path": "src/components/layout/Sidebar.tsx",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "`@${displayName}`",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "Sidebar DM drag panel title uses @displayName protocol form."
+  },
+  {
+    "path": "src/components/layout/Sidebar.tsx",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "`@${draggedAgent.displayName || draggedAgent.name}`",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "Sidebar agent drag panel title uses @name protocol form."
+  },
+  {
+    "path": "src/components/layout/Sidebar.tsx",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "`@${human?.displayName || human?.name || userId}`",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "Opening a human panel from the sidebar uses @handle protocol title form."
+  },
+  {
+    "path": "src/components/layout/Sidebar.tsx",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "`@${human.displayName || human.name}`",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "Sidebar Humans list drag/open panel title uses @name protocol form."
+  },
+  {
+    "path": "src/components/layout/Sidebar.tsx",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "`#${draggedChannel.name}`",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "Drag-to-workspace channel panel title uses #channelName protocol form."
+  },
+  {
+    "path": "src/components/machine/MachineDetailPanel.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "(v",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "User-visible version marker (v{version}) beside the upgrade control."
+  },
+  {
+    "path": "src/components/machine/MachineDetailPanel.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "~/.slock/agents/",
+    "count": 1,
+    "classification": "code_example",
+    "reason": "Example local agent workspace path shown on the machine detail card."
+  },
+  {
+    "path": "src/components/machine/MachineDetailPanel.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "v",
+    "count": 2,
+    "classification": "protocol",
+    "reason": "User-visible version prefix v in v{computerVersion}/v{daemonVersion} notation."
+  },
+  {
+    "path": "src/components/machine/MobileComputersPanel.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "→ v",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "User-visible → v{version} upgrade marker on MobileComputersPanel, same protocol as Sidebar."
+  },
+  {
+    "path": "src/components/member/HumanDetailPanel.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "@",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "Protocol @ prefix before the human handle on the human detail page."
+  },
+  {
+    "path": "src/components/member/HumanDetailPanel.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "`@${human.name}`",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "PanelHeader title/subtitle uses @human.name protocol handle form."
+  },
+  {
+    "path": "src/components/member/humanMembershipStatus.ts",
+    "rule": "raft-i18n/no-literal-return-prose",
+    "source": "\"Left\"",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "Membership discriminant label returned for status=left; keep as protocol membership token, not UI prose."
+  },
+  {
+    "path": "src/components/member/humanMembershipStatus.ts",
+    "rule": "raft-i18n/no-literal-return-prose",
+    "source": "\"Removed\"",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "Membership discriminant label returned for status=removed; keep as protocol membership token, not UI prose."
+  },
+  {
+    "path": "src/components/message/MessageInput.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "@",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "Protocol @ prefix before handles in the mention candidate list."
+  },
+  {
+    "path": "src/components/message/MessageItem.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "@",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "Protocol @name prefix for task-badge assignees in messages."
+  },
+  {
+    "path": "src/components/message/MessageItem.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "msg",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "Trailing msg chip on channel-ref deep links; matches the slock-ref msg= protocol token."
+  },
+  {
+    "path": "src/components/message/ProfilePreviewCardContent.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "@",
+    "count": 2,
+    "classification": "protocol",
+    "reason": "Protocol @ prefix before agent/human handles in the profile preview card."
+  },
+  {
+    "path": "src/components/search/MessageSearchPage.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "Esc",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "Production search-rail keyboard-cap hint for Esc; same keycap protocol as ⌘K/Ctrl+K."
+  },
+  {
+    "path": "src/components/search/MessageSearchPage.tsx",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "`@${result.channelName}`",
+    "count": 2,
+    "classification": "protocol",
+    "reason": "DM search-result panel title uses @channelName peer-ref protocol form."
+  },
+  {
+    "path": "src/components/search/MessageSearchPage.tsx",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "`#${ch.name}`",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "Search channel filter chip/menu shows channel refs as #name protocol form."
+  },
+  {
+    "path": "src/components/search/MessageSearchPage.tsx",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "`#${result.channelName}`",
+    "count": 2,
+    "classification": "protocol",
+    "reason": "Opening/dragging a search result panel titles the channel as #channelName."
+  },
+  {
+    "path": "src/components/settings/AppNotificationsControls.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "placeholder=\"https://example.com/raft/events\"",
+    "count": 1,
+    "classification": "code_example",
+    "reason": "Example webhook URL placeholder in AppNotificationsControls."
+  },
+  {
+    "path": "src/components/settings/MemberGraphSection.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "A",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "Compact agent-count suffix A in MemberGraph channel rows ({humanCount}H/{agentCount}A); approved protocol notation."
+  },
+  {
+    "path": "src/components/settings/MemberGraphSection.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "H/",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "Compact human-count suffix H/ in MemberGraph channel rows ({humanCount}H/{agentCount}A); approved protocol notation."
+  },
+  {
+    "path": "src/components/settings/ProviderConnectionsSettings.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "placeholder=\"https://gateway.example.com/v1\"",
+    "count": 1,
+    "classification": "code_example",
+    "reason": "Example custom gateway endpoint URL placeholder."
+  },
+  {
+    "path": "src/components/settings/ReleaseNotesPanel.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "Current",
+    "count": 1,
+    "classification": "owner_managed",
+    "reason": "ReleaseNotesPanel 'Current' badge on the active version entry. Eric owns this panel; migrate only with owner-approved dedicated change."
+  },
+  {
+    "path": "src/components/settings/ReleaseNotesPanel.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "title=\"Release Notes\"",
+    "count": 1,
+    "classification": "owner_managed",
+    "reason": "ReleaseNotesPanel PanelHeader title. Eric owns this panel; migrate only with owner-approved dedicated change."
+  },
+  {
+    "path": "src/components/settings/ReleaseNotesPanel.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "What&apos;s New",
+    "count": 1,
+    "classification": "owner_managed",
+    "reason": "ReleaseNotesPanel SectionEyebrow \"What's New\". Eric owns this panel; migrate only with owner-approved dedicated change."
+  },
+  {
+    "path": "src/components/settings/ReleaseNotesPanel.tsx",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "\"BREAKING\"",
+    "count": 1,
+    "classification": "owner_managed",
+    "reason": "ReleaseNotesPanel BREAKING release-type badge. Eric owns this panel; migrate only with owner-approved dedicated change."
+  },
+  {
+    "path": "src/components/settings/ReleaseNotesPanel.tsx",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "\"DEPRECATED\"",
+    "count": 1,
+    "classification": "owner_managed",
+    "reason": "ReleaseNotesPanel DEPRECATED release-type badge. Eric owns this panel; migrate only with owner-approved dedicated change."
+  },
+  {
+    "path": "src/components/settings/ReleaseNotesPanel.tsx",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "\"FIX\"",
+    "count": 1,
+    "classification": "owner_managed",
+    "reason": "ReleaseNotesPanel FIX release-type badge. Eric owns this panel; migrate only with owner-approved dedicated change."
+  },
+  {
+    "path": "src/components/settings/ReleaseNotesPanel.tsx",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "\"IMPROVED\"",
+    "count": 1,
+    "classification": "owner_managed",
+    "reason": "ReleaseNotesPanel IMPROVED release-type badge. Eric owns this panel; migrate only with owner-approved dedicated change."
+  },
+  {
+    "path": "src/components/settings/ReleaseNotesPanel.tsx",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "\"NEW\"",
+    "count": 1,
+    "classification": "owner_managed",
+    "reason": "ReleaseNotesPanel NEW release-type badge. Eric owns this panel; migrate only with owner-approved dedicated change."
+  },
+  {
+    "path": "src/components/settings/settingsNavigation.ts",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "\"About\"",
+    "count": 2,
+    "classification": "legacy",
+    "reason": "Legacy SETTINGS_TABS English About field; production display uses settings.tabs.about."
+  },
+  {
+    "path": "src/components/settings/settingsNavigation.ts",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "\"Account\"",
+    "count": 2,
+    "classification": "legacy",
+    "reason": "Legacy SETTINGS_TABS English Account field; production display uses the catalog."
+  },
+  {
+    "path": "src/components/settings/settingsNavigation.ts",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "\"Administration\"",
+    "count": 2,
+    "classification": "legacy",
+    "reason": "Legacy SETTINGS_TABS English Administration field; production display uses the catalog."
+  },
+  {
+    "path": "src/components/settings/settingsNavigation.ts",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "\"AI Providers\"",
+    "count": 2,
+    "classification": "legacy",
+    "reason": "Legacy SETTINGS_TABS English label/title; production nav uses catalog ids and does not consume SETTINGS_LABEL_BY_ID."
+  },
+  {
+    "path": "src/components/settings/settingsNavigation.ts",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "\"Appearance\"",
+    "count": 2,
+    "classification": "legacy",
+    "reason": "Legacy SETTINGS_TABS English Appearance field; production display uses the catalog."
+  },
+  {
+    "path": "src/components/settings/settingsNavigation.ts",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "\"Applications\"",
+    "count": 2,
+    "classification": "legacy",
+    "reason": "Legacy SETTINGS_TABS English Applications field; production display uses the catalog."
+  },
+  {
+    "path": "src/components/settings/settingsNavigation.ts",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "\"Feedback\"",
+    "count": 1,
+    "classification": "legacy",
+    "reason": "Legacy SETTINGS_TABS English Feedback label; production nav uses feedbackTitle catalog id."
+  },
+  {
+    "path": "src/components/settings/settingsNavigation.ts",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "\"Labs\"",
+    "count": 2,
+    "classification": "legacy",
+    "reason": "Legacy SETTINGS_TABS English Labs field; production display uses the catalog."
+  },
+  {
+    "path": "src/components/settings/settingsNavigation.ts",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "\"Language & Region\"",
+    "count": 2,
+    "classification": "legacy",
+    "reason": "Legacy SETTINGS_TABS English Language & Region field; production display uses the catalog."
+  },
+  {
+    "path": "src/components/settings/settingsNavigation.ts",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "\"MCP Servers\"",
+    "count": 2,
+    "classification": "legacy",
+    "reason": "Legacy SETTINGS_TABS English MCP Servers field; production display uses the catalog."
+  },
+  {
+    "path": "src/components/settings/settingsNavigation.ts",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "\"My Feedback\"",
+    "count": 1,
+    "classification": "legacy",
+    "reason": "Legacy SETTINGS_TABS English My Feedback title; production panel title uses the catalog."
+  },
+  {
+    "path": "src/components/settings/settingsNavigation.ts",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "\"Notifications\"",
+    "count": 2,
+    "classification": "legacy",
+    "reason": "Legacy SETTINGS_TABS English Notifications field; production display uses the catalog."
+  },
+  {
+    "path": "src/components/settings/settingsNavigation.ts",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "\"Plan & Billing\"",
+    "count": 2,
+    "classification": "legacy",
+    "reason": "Legacy SETTINGS_TABS English Plan & Billing field; production display uses the catalog."
+  },
+  {
+    "path": "src/components/settings/settingsNavigation.ts",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "\"Server Profile\"",
+    "count": 2,
+    "classification": "legacy",
+    "reason": "Legacy SETTINGS_TABS English Server Profile field; production display uses the catalog."
+  },
+  {
+    "path": "src/components/settings/SettingsPanel.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "placeholder=\"https://example.com\"",
+    "count": 1,
+    "classification": "code_example",
+    "reason": "Example HTTPS URL placeholder in SettingsPanel."
+  },
+  {
+    "path": "src/components/settings/SettingsPanel.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "placeholder=\"https://example.com/.well-known/raft-agent-manifest.json\"",
+    "count": 1,
+    "classification": "code_example",
+    "reason": "Example well-known agent-manifest URL placeholder."
+  },
+  {
+    "path": "src/components/settings/SettingsPanel.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "placeholder=\"https://example.com/login/callback\"",
+    "count": 1,
+    "classification": "code_example",
+    "reason": "Example OAuth login-callback URL placeholder."
+  },
+  {
+    "path": "src/components/settings/SettingsPanel.tsx",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "`@${agent.name}${agent.displayName ? ` (${agent.displayName})` : \"\"}`",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "OnboardingAgentSection select option shows agents as @name protocol handles."
+  },
+  {
+    "path": "src/components/task/LegacyTaskPanel.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "@",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "Protocol @ handle prefix before creator/assignee names in LegacyTaskPanel."
+  },
+  {
+    "path": "src/components/task/LegacyTaskPanel.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "#",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "Protocol # channel-ref prefix before the LegacyTaskPanel title channel name."
+  },
+  {
+    "path": "src/components/task/LegacyTaskPanel.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "`@${task.claimedByName}`",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "Claimed-by display uses @claimedByName protocol handle form."
+  },
+  {
+    "path": "src/components/task/TaskCard.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "#",
+    "count": 2,
+    "classification": "protocol",
+    "reason": "Protocol # prefix before channel names and task numbers on TaskCard."
+  },
+  {
+    "path": "src/components/task/TasksPanel.tsx",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "`#${channel.name}`",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "Channel filter option labels use #channelName protocol form."
+  },
+  {
+    "path": "src/components/thread/ThreadsInbox.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "#",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "Protocol # prefix before task numbers on thread-card task badges."
+  },
+  {
+    "path": "src/components/thread/ThreadsInbox.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "` @${threadItem.taskClaimedByName}`",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "Task-badge claimer fragment uses @name protocol form."
+  },
+  {
+    "path": "src/components/ui/cards/QuotedMessageCard.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "`@${channelName}`",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "Quoted-message card shows DM peers as @channelName protocol form."
+  },
+  {
+    "path": "src/components/ui/ServerSwitcherMenu.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "\"99+\"",
+    "count": 2,
+    "classification": "protocol",
+    "reason": "User-visible unread overflow protocol (unread>99 ? \"99+\"); aligned with Sidebar/ImageLightbox."
+  },
+  {
+    "path": "src/components/workspace/WorkspaceGridDemo.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "⌘W",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "User-visible close-menu keycap ⌘W; keyboard-cap protocol like MessageSearchPage Esc."
+  },
+  {
+    "path": "src/components/workspace/WorkspaceGridDemo.tsx",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "`@${dm.peerDisplayName || dm.peerName || dm.name}`",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "Opening a DM from the workspace demo titles it as @peerName."
+  },
+  {
+    "path": "src/components/workspace/WorkspaceGridDemo.tsx",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "`#${channel.name}`",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "Opening/dragging a channel into the workspace titles it as #channelName."
+  },
+  {
+    "path": "src/components/workspace/WorkspaceGridRealPanel.tsx",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "`@${displayName}`",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "Opening a profile panel titles it as @displayName protocol form."
+  },
+  {
+    "path": "src/components/workspace/WorkspaceGridRealPanel.tsx",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "`@${dm.peerDisplayName || dm.peerName || dm.name}`",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "Opening a parent DM from a thread titles it as @peerName."
+  },
+  {
+    "path": "src/components/workspace/WorkspaceGridRealPanel.tsx",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "`#${channel?.name || channelId}`",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "Opening a channel panel titles it as #channelName protocol form."
+  },
+  {
+    "path": "src/components/workspace/WorkspaceGridRealPanel.tsx",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "`task #${task.taskNumber}`",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "Opening a task thread from Tasks uses task #N protocol form."
+  },
+  {
+    "path": "src/generated/reactionSpriteManifest.ts",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "\"Check mark\"",
+    "count": 1,
+    "classification": "legacy",
+    "reason": "Generated reaction sprite label; ReactionGlyph uses coordinates only and is aria-hidden, so production UI never shows this string."
+  },
+  {
+    "path": "src/generated/reactionSpriteManifest.ts",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "\"Eyes\"",
+    "count": 1,
+    "classification": "legacy",
+    "reason": "Generated reaction sprite label unused at runtime; UI reads sprite coordinates only."
+  },
+  {
+    "path": "src/generated/reactionSpriteManifest.ts",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "\"Face with tears of joy\"",
+    "count": 1,
+    "classification": "legacy",
+    "reason": "Generated reaction sprite label unused at runtime; UI reads sprite coordinates only."
+  },
+  {
+    "path": "src/generated/reactionSpriteManifest.ts",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "\"Fire\"",
+    "count": 1,
+    "classification": "legacy",
+    "reason": "Generated reaction sprite label unused at runtime; UI reads sprite coordinates only."
+  },
+  {
+    "path": "src/generated/reactionSpriteManifest.ts",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "\"Heart\"",
+    "count": 1,
+    "classification": "legacy",
+    "reason": "Generated reaction sprite label unused at runtime; UI reads sprite coordinates only."
+  },
+  {
+    "path": "src/generated/reactionSpriteManifest.ts",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "\"Party popper\"",
+    "count": 1,
+    "classification": "legacy",
+    "reason": "Generated reaction sprite label unused at runtime; UI reads sprite coordinates only."
+  },
+  {
+    "path": "src/generated/reactionSpriteManifest.ts",
+    "rule": "formatjs/no-literal-string-in-object",
+    "source": "\"Thumbs up\"",
+    "count": 1,
+    "classification": "legacy",
+    "reason": "Generated reaction sprite label unused at runtime; UI reads sprite coordinates only."
+  },
+  {
+    "path": "src/pages/PaletteAuditPage.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "(&quot;@mentioned&quot;)",
+    "count": 1,
+    "classification": "code_example",
+    "reason": "Quoted @mentioned state term in PaletteAudit documentation; keep as code/term example."
+  },
+  {
+    "path": "src/pages/PaletteAuditPage.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "@stdrc",
+    "count": 1,
+    "classification": "user_data_example",
+    "reason": "Simulated @mention username in the PaletteAudit MentionLink sample."
+  },
+  {
+    "path": "src/pages/PaletteAuditPage.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "@theme",
+    "count": 1,
+    "classification": "technical",
+    "reason": "Tailwind CSS directive shown as implementation documentation."
+  },
+  {
+    "path": "src/pages/PaletteAuditPage.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "&quot;CTA&quot;",
+    "count": 1,
+    "classification": "code_example",
+    "reason": "Quoted design-semantic term CTA in PaletteAudit documentation; keep as code/term example."
+  },
+  {
+    "path": "src/pages/PaletteAuditPage.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "&quot;destructive&quot;",
+    "count": 1,
+    "classification": "code_example",
+    "reason": "Quoted design-semantic term destructive in PaletteAudit documentation; keep as code/term example."
+  },
+  {
+    "path": "src/pages/PaletteAuditPage.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "#E08585",
+    "count": 1,
+    "classification": "technical",
+    "reason": "Hex color value shown in the palette implementation audit."
+  },
+  {
+    "path": "src/pages/PaletteAuditPage.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "#engineering",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "PaletteAudit sample of #channel ref styling; keep protocol shape."
+  },
+  {
+    "path": "src/pages/PaletteAuditPage.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "#general",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "PaletteAudit message deep-link sample using #general channel ref protocol form."
+  },
+  {
+    "path": "src/pages/PaletteAuditPage.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "#proj-uiux:0e6befb8",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "PaletteAudit joint/project channel-ref sample; keep protocol spelling."
+  },
+  {
+    "path": "src/pages/PaletteAuditPage.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "99+",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "PaletteAudit unread-badge sample of the fixed 99+ overflow protocol notation."
+  },
+  {
+    "path": "src/pages/PaletteAuditPage.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "Add Machine",
+    "count": 1,
+    "classification": "internal_dev",
+    "reason": "PaletteAudit CTA button sample mirroring product copy for visual audit only."
+  },
+  {
+    "path": "src/pages/PaletteAuditPage.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "bg-brutal-lavender/40",
+    "count": 1,
+    "classification": "technical",
+    "reason": "Tailwind utility class shown as implementation documentation."
+  },
+  {
+    "path": "src/pages/PaletteAuditPage.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "brutal-pink",
+    "count": 1,
+    "classification": "technical",
+    "reason": "Theme token name shown in the palette implementation audit."
+  },
+  {
+    "path": "src/pages/PaletteAuditPage.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "brutal-red",
+    "count": 1,
+    "classification": "technical",
+    "reason": "Theme token name shown in the palette implementation audit."
+  },
+  {
+    "path": "src/pages/PaletteAuditPage.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "Delete",
+    "count": 1,
+    "classification": "internal_dev",
+    "reason": "PaletteAudit destructive confirm button sample; audit page only."
+  },
+  {
+    "path": "src/pages/PaletteAuditPage.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "Delete Agent",
+    "count": 1,
+    "classification": "internal_dev",
+    "reason": "PaletteAudit Delete Agent button sample; audit page only."
+  },
+  {
+    "path": "src/pages/PaletteAuditPage.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "Delete Computer",
+    "count": 1,
+    "classification": "internal_dev",
+    "reason": "PaletteAudit Delete Computer button sample; audit page only."
+  },
+  {
+    "path": "src/pages/PaletteAuditPage.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "error",
+    "count": 1,
+    "classification": "internal_dev",
+    "reason": "PaletteAudit activity-dot caption label 'error'; sample UI on the audit page."
+  },
+  {
+    "path": "src/pages/PaletteAuditPage.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "file:line",
+    "count": 1,
+    "classification": "technical",
+    "reason": "Placeholder notation documenting the source-reference format."
+  },
+  {
+    "path": "src/pages/PaletteAuditPage.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "fires 14:35",
+    "count": 1,
+    "classification": "internal_dev",
+    "reason": "Fictional PaletteAudit reminder sample ('fires 14:35'); production uses recurrence.description instead."
+  },
+  {
+    "path": "src/pages/PaletteAuditPage.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "general",
+    "count": 1,
+    "classification": "user_data_example",
+    "reason": "Simulated selected-channel name general in the PaletteAudit sidebar sample."
+  },
+  {
+    "path": "src/pages/PaletteAuditPage.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "getActivityDotClass()",
+    "count": 1,
+    "classification": "technical",
+    "reason": "Function identifier shown as source-reference documentation."
+  },
+  {
+    "path": "src/pages/PaletteAuditPage.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "Hover Me",
+    "count": 1,
+    "classification": "internal_dev",
+    "reason": "PaletteAudit menu hover-state sample button text; audit interaction demo only."
+  },
+  {
+    "path": "src/pages/PaletteAuditPage.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "In review",
+    "count": 1,
+    "classification": "internal_dev",
+    "reason": "PaletteAudit in-review task badge sample; audit page only."
+  },
+  {
+    "path": "src/pages/PaletteAuditPage.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "MentionLink.tsx:27",
+    "count": 1,
+    "classification": "technical",
+    "reason": "Source file and line reference shown in the palette implementation audit."
+  },
+  {
+    "path": "src/pages/PaletteAuditPage.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "msg",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "PaletteAudit message deep-link sample of the msg protocol fragment."
+  },
+  {
+    "path": "src/pages/PaletteAuditPage.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "New Task",
+    "count": 1,
+    "classification": "internal_dev",
+    "reason": "PaletteAudit small pink CTA button sample; audit page only."
+  },
+  {
+    "path": "src/pages/PaletteAuditPage.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "No machine connected.",
+    "count": 1,
+    "classification": "internal_dev",
+    "reason": "PaletteAudit settings warning-card sample copy; audit page only."
+  },
+  {
+    "path": "src/pages/PaletteAuditPage.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "online",
+    "count": 1,
+    "classification": "internal_dev",
+    "reason": "PaletteAudit activity-dot caption label 'online'; sample UI on the audit page."
+  },
+  {
+    "path": "src/pages/PaletteAuditPage.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "packages/web/src/index.css",
+    "count": 1,
+    "classification": "technical",
+    "reason": "Repository source path shown as implementation documentation."
+  },
+  {
+    "path": "src/pages/PaletteAuditPage.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "S",
+    "count": 1,
+    "classification": "user_data_example",
+    "reason": "Simulated server-avatar initial S on the PaletteAudit LeftRail sample."
+  },
+  {
+    "path": "src/pages/PaletteAuditPage.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "Switch or Create Server",
+    "count": 1,
+    "classification": "internal_dev",
+    "reason": "PaletteAudit ServerSwitcher menu-item sample; audit page only."
+  },
+  {
+    "path": "src/pages/PaletteAuditPage.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "task #92",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "PaletteAudit valid task-ref link sample; keep protocol spelling."
+  },
+  {
+    "path": "src/pages/PaletteAuditPage.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "task #abc",
+    "count": 1,
+    "classification": "protocol",
+    "reason": "PaletteAudit invalid task-ref sample; keep protocol spelling."
+  },
+  {
+    "path": "src/pages/PaletteAuditPage.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "The",
+    "count": 1,
+    "classification": "internal_dev",
+    "reason": "Residual English article fragment left in PaletteAudit documentation after partial i18n."
+  },
+  {
+    "path": "src/pages/PaletteAuditPage.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "thinking…",
+    "count": 1,
+    "classification": "internal_dev",
+    "reason": "PaletteAudit activity-dot caption label 'thinking…'; sample UI on the audit page."
+  },
+  {
+    "path": "src/pages/PaletteAuditPage.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "This will remove all associated data and cannot be undone.",
+    "count": 1,
+    "classification": "internal_dev",
+    "reason": "PaletteAudit ConfirmDialog warning-body sample; audit page only."
+  },
+  {
+    "path": "src/pages/PaletteAuditPage.tsx",
+    "rule": "formatjs/no-literal-string-in-jsx",
+    "source": "Title cannot be empty.",
+    "count": 1,
+    "classification": "internal_dev",
+    "reason": "PaletteAudit CreateTaskDialog validation-error sample; audit page only."
+  },
+  {
+    "path": "src/utils/runtimeConfigForm.ts",
+    "rule": "raft-i18n/no-literal-return-prose",
+    "source": "\"Cursor CLI does not expose a per-agent API URL flag or env var. Configure provider routing in Cursor itself.\"",
+    "count": 1,
+    "classification": "legacy",
+    "reason": "runtimeApiUrlUnsupportedCopy is referenced only by unit tests; RuntimeConfig UI does not mount this explanation."
+  }
+]

@@ -1,0 +1,80 @@
+{
+  "name": "@botiverse/raft-daemon",
+  "version": "1.0.25",
+  "license": "FSL-1.1-ALv2",
+  "type": "module",
+  "bin": {
+    "raft-daemon": "dist/raft-daemon.js",
+    "slock-daemon": "dist/slock-daemon.js"
+  },
+  "exports": {
+    "./core": {
+      "types": "./src/core.ts",
+      "import": "./dist/core.js"
+    },
+    "./dist/raft-daemon.js": "./dist/raft-daemon.js",
+    "./dist/slock-daemon.js": "./dist/slock-daemon.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/botiverse/raft-source.git",
+    "directory": "packages/daemon"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "dev": "pnpm --filter @botiverse/raft build && tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "build": "pnpm --filter @botiverse/raft build && tsup && node -e \"require('fs').cpSync('../cli/dist','dist/cli',{recursive:true})\" && node scripts/write-dist-bins.mjs",
+    "test": "vitest run",
+    "test:sea-host": "vitest run --config vitest.sea-host.config.ts",
+    "prepack": "pnpm run build",
+    "prepublishOnly": "pnpm run build",
+    "typecheck": "tsc --noEmit",
+    "lint:publish-package": "node scripts/check-publish-package.mjs",
+    "generate:raft-cli-guide": "tsx scripts/generate-raft-cli-guide.ts",
+    "check:raft-cli-guide-fresh": "pnpm generate:raft-cli-guide && git diff --exit-code ../../manual/agent-knowledge/raft-cli-overview.md",
+    "generate:pi-builtin-models": "tsx scripts/generate-pi-builtin-models.ts",
+    "check:pi-builtin-models-fresh": "pnpm generate:pi-builtin-models && git diff --exit-code ../shared/src/piBuiltinModels.generated.ts",
+    "release:sdk-preflight": "node scripts/release-runtime-sdk-preflight.mjs",
+    "release:patch": "node scripts/release-runtime-sdk-preflight.mjs && npm version patch --no-git-tag-version && cd ../.. && pnpm install --lockfile-only && git add packages/daemon/package.json packages/daemon/runtime-sdk-release-preflight.json pnpm-lock.yaml packages/shared/src/piBuiltinModels.generated.ts packages/shared/src/generated/runtimeProviderDisplayNames.ts && git commit -m \"chore: bump @botiverse/raft-daemon to v$(node -p \"require('./packages/daemon/package.json').version\")\" && git tag daemon-v$(node -p \"require('./packages/daemon/package.json').version\") && git push && git push --tags",
+    "release:minor": "node scripts/release-runtime-sdk-preflight.mjs && npm version minor --no-git-tag-version && cd ../.. && pnpm install --lockfile-only && git add packages/daemon/package.json packages/daemon/runtime-sdk-release-preflight.json pnpm-lock.yaml packages/shared/src/piBuiltinModels.generated.ts packages/shared/src/generated/runtimeProviderDisplayNames.ts && git commit -m \"chore: bump @botiverse/raft-daemon to v$(node -p \"require('./packages/daemon/package.json').version\")\" && git tag daemon-v$(node -p \"require('./packages/daemon/package.json').version\") && git push && git push --tags",
+    "release:major": "node scripts/release-runtime-sdk-preflight.mjs && npm version major --no-git-tag-version && cd ../.. && pnpm install --lockfile-only && git add packages/daemon/package.json packages/daemon/runtime-sdk-release-preflight.json pnpm-lock.yaml packages/shared/src/piBuiltinModels.generated.ts packages/shared/src/generated/runtimeProviderDisplayNames.ts && git commit -m \"chore: bump @botiverse/raft-daemon to v$(node -p \"require('./packages/daemon/package.json').version\")\" && git tag daemon-v$(node -p \"require('./packages/daemon/package.json').version\") && git push && git push --tags",
+    "release:alpha": "node scripts/release-runtime-sdk-preflight.mjs && npm version prerelease --preid=alpha --no-git-tag-version && cd ../.. && pnpm install --lockfile-only && git add packages/daemon/package.json packages/daemon/runtime-sdk-release-preflight.json pnpm-lock.yaml packages/shared/src/piBuiltinModels.generated.ts packages/shared/src/generated/runtimeProviderDisplayNames.ts && git commit -m \"chore: bump @botiverse/raft-daemon to v$(node -p \"require('./packages/daemon/package.json').version\")\" && git tag daemon-v$(node -p \"require('./packages/daemon/package.json').version\") && git push && git push --tags"
+  },
+  "dependencies": {
+    "@botiverse/kimi-code-sdk": "0.34.0-botiverse.0",
+    "@botiverse/oar": "0.0.7",
+    "@earendil-works/pi-ai": "0.85.1",
+    "@earendil-works/pi-coding-agent": "0.85.1",
+    "@jackwener/opencli": "^1.8.3",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "ajv": "^8.18.0",
+    "commander": "^12.1.0",
+    "https-proxy-agent": "^7.0.6",
+    "safe-regex2": "5.1.1",
+    "tar-stream": "2.2.0",
+    "typebox": "1.1.38",
+    "undici": "^7.24.7",
+    "ws": "^8.20.0",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@botiverse/raft": "workspace:*",
+    "@botiverse/raft-shared": "workspace:*",
+    "@botiverse/raft-trace-client": "workspace:*",
+    "@types/node": "^25.5.0",
+    "@types/tar-stream": "3.1.4",
+    "@types/ws": "^8.18.1",
+    "diff": "8.0.4",
+    "fast-check": "^4.8.0",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3",
+    "vitest": "^2.1.0"
+  }
+}

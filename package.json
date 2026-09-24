@@ -1,0 +1,40 @@
+{
+  "name": "raft",
+  "version": "0.1.0",
+  "license": "FSL-1.1-ALv2",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "packageManager": "pnpm@10.29.3",
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "argon2",
+      "electron",
+      "esbuild",
+      "sharp",
+      "workerd"
+    ],
+    "patchedDependencies": {
+      "@botiverse/k-carrier@0.1.8": "patches/@botiverse__k-carrier@0.1.8.patch",
+      "@botiverse/hands-node@0.5.1": "patches/@botiverse__hands-node@0.5.1.patch"
+    }
+  },
+  "scripts": {
+    "check:misc": "bash scripts/check-misc.sh",
+    "perf:boot-profile": "node scripts/perf/boot-profile.cjs",
+    "test:raftdev": "node --import tsx --test scripts/dev/raftdev-*.test.ts",
+    "test:source-available": "node --test scripts/source-available/export-snapshot.test.mjs scripts/source-available/release.test.mjs",
+    "typecheck:raftdev": "tsc -p tsconfig.raftdev.json",
+    "test:web": "node packages/web/scripts/run-vitest-tests.mjs",
+    "test:web:dom": "node packages/web/scripts/run-vitest-tests.mjs --dom",
+    "test:ax-book": "node --test scripts/visualize/ax-surfaces/book.test.mjs"
+  },
+  "devDependencies": {
+    "marked": "^18.0.7",
+    "playwright": "^1.59.1",
+    "tsx": "^4.21.0",
+    "typescript": "5.9.3"
+  }
+}

@@ -1,0 +1,38 @@
+{
+  "name": "@botiverse/raft-computer-app",
+  "version": "0.1.2",
+  "license": "FSL-1.1-ALv2",
+  "private": true,
+  "type": "module",
+  "main": "dist/main.js",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build:deps": "pnpm --filter @botiverse/raft-computer build && pnpm --filter @botiverse/raft build",
+    "build:main": "tsup --config tsup.config.ts",
+    "build": "pnpm run build:deps && pnpm run build:main",
+    "start": "pnpm run build && node scripts/dev-start.mjs",
+    "test:unit": "node --import tsx --test src/menuModel.test.ts src/actionRunner.test.ts src/bundleSelfContained.test.ts src/crossSurfaceVersionDrift.test.ts src/serviceDispatcher.test.ts src/trayMenuReveal.test.ts src/onboardingWindow.test.ts src/onboarding/workspaceStep.test.ts src/onboarding/Recovery.test.tsx src/onboarding/recoveryDiagnostics.test.ts src/onboardingRecoveryContract.test.ts src/onboardingMigration.test.ts src/macosReleaseWorkflow.contract.test.ts scripts/dev-start.test.mjs",
+    "dist": "pnpm run build && electron-builder --config electron-builder.yml",
+    "dist:mac": "pnpm run build && electron-builder --mac --config electron-builder.yml",
+    "dist:mac:release": "pnpm run build && electron-builder --mac --config electron-builder.release.yml --publish never",
+    "verify": "pnpm run typecheck && pnpm run test:unit"
+  },
+  "dependencies": {
+    "@botiverse/raft": "workspace:*",
+    "@botiverse/raft-computer": "workspace:*",
+    "@botiverse/raft-shared": "workspace:*",
+    "@botiverse/raft-trace-client": "workspace:*",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "electron": "^36.2.1",
+    "electron-builder": "^25.1.8",
+    "tsup": "^8.5.1",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}

@@ -1,0 +1,1 @@
+ALTER TABLE "server_members" ADD COLUMN "pinned_refs" json;

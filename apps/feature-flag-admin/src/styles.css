@@ -1,0 +1,85 @@
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap');
+@import "tailwindcss";
+
+@source "./**/*.{ts,tsx}";
+
+@theme {
+  --color-brutal-yellow: #FFD440;
+  --color-brutal-pink: #FE7DA8;
+  --color-brutal-lavender: #BBAFE6;
+  --color-brutal-cream: #FFFAEF;
+  --color-brutal-black: #141111;
+  --color-brutal-cyan: #27CCF3;
+  --color-brutal-orange: #F8A16F;
+  --color-brutal-lime: #A9D877;
+  --color-brutal-red: #F97264;
+
+  --font-display: 'Space Grotesk', system-ui, sans-serif;
+  --font-mono: 'Space Mono', ui-monospace, monospace;
+
+  --shadow-brutal: 4px 4px 0px #141111;
+  --shadow-brutal-sm: 2px 2px 0px #141111;
+  --shadow-brutal-lg: 6px 6px 0px #141111;
+  --shadow-brutal-active: 1px 1px 0px #141111;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background: #fffaf0;
+  color: #141111;
+  font-family: 'Space Grotesk', system-ui, sans-serif;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+*:focus-visible {
+  outline: 2px solid #000;
+  outline-offset: 2px;
+}
+
+button,
+[role="button"] {
+  cursor: default;
+  user-select: none;
+}
+
+@layer components {
+  .btn-brutal {
+    @apply inline-flex items-center justify-center gap-1.5 border-2 border-black font-display font-bold shadow-brutal
+           transition-all duration-100 active:translate-x-[2px] active:translate-y-[2px] active:shadow-brutal-active;
+  }
+
+  .btn-brutal:hover {
+    @apply -translate-y-[1px] shadow-brutal-lg;
+  }
+
+  .btn-brutal-sm {
+    @apply inline-flex items-center justify-center gap-1.5 border-2 border-black font-display font-bold shadow-brutal-sm
+           transition-all duration-100 active:translate-x-[1px] active:translate-y-[1px] active:shadow-brutal-active;
+  }
+
+  .btn-brutal-sm:hover {
+    @apply -translate-y-[1px] shadow-brutal;
+  }
+
+  .btn-brutal:disabled,
+  .btn-brutal-sm:disabled {
+    @apply pointer-events-none opacity-40;
+    transform: none;
+  }
+
+  .control {
+    @apply h-10 w-full border-2 border-black bg-white px-3 text-sm font-semibold;
+  }
+}

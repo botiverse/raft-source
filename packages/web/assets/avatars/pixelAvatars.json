@@ -1,0 +1,260 @@
+{
+  "version": 1,
+  "comment": "Canonical pixel-avatar definitions for the Slock agent avatar system (task #352). Consumed by packages/web/src/components/agent/PixelAvatar.tsx. palette maps single letters to hex colors (_ = transparent). Each avatar grid is 8 rows of 8 palette letters; bg is a palette letter, or a literal #hex for one-off backgrounds (finch, mug). Entry order matters: it is the picker/grid order. reservedKeys are excluded from AVATAR_KEYS (random pick + manual picker). The seeded-random avatar generator (mulberry32 identicons for pixel:random:seed) intentionally stays in PixelAvatar.tsx code, not here.",
+  "palette": {
+    "_": "transparent",
+    "K": "#141111",
+    "W": "#FFFFFF",
+    "P": "#FE7DA8",
+    "O": "#F8A16F",
+    "Y": "#FFD440",
+    "L": "#A9D877",
+    "C": "#27CCF3",
+    "V": "#BBAFE6",
+    "B": "#576574",
+    "R": "#F97264",
+    "G": "#9DCAAA",
+    "D": "#B07A4E"
+  },
+  "avatars": {
+    "robot": {
+      "bg": "C",
+      "grid": [
+        "_KKKKKK_",
+        "KCKWWKCK",
+        "KWKWWKWK",
+        "KKKKKKKK",
+        "_KWKKWK_",
+        "_KKKKKK_",
+        "_KK__KK_",
+        "_KK__KK_"
+      ]
+    },
+    "cat": {
+      "bg": "Y",
+      "grid": [
+        "K______K",
+        "KK____KK",
+        "KYKYYKYK",
+        "KYYYYYYK",
+        "KYKYYKYK",
+        "_KYYYYK_",
+        "__KYYK__",
+        "___KK___"
+      ]
+    },
+    "ghost": {
+      "bg": "V",
+      "grid": [
+        "__KKKK__",
+        "_KWWWWK_",
+        "KWKWWKWK",
+        "KWWWWWWK",
+        "KWWWWWWK",
+        "KWWKKWWK",
+        "KWKWWKWK",
+        "K_K__K_K"
+      ]
+    },
+    "skull": {
+      "bg": "O",
+      "grid": [
+        "_KKKKKK_",
+        "KWWWWWWK",
+        "KWKWWKWK",
+        "KWWWWWWK",
+        "_KWWWWK_",
+        "_KWKWKK_",
+        "__KKKK__",
+        "___KK___"
+      ]
+    },
+    "alien": {
+      "bg": "L",
+      "grid": [
+        "_KKKKKK_",
+        "KGGGGGGK",
+        "KGKKKKGK",
+        "KGGGGGGK",
+        "_KGGGGK_",
+        "__KGGK__",
+        "__KGGK__",
+        "_KK__KK_"
+      ]
+    },
+    "heart": {
+      "bg": "P",
+      "grid": [
+        "________",
+        "_KK__KK_",
+        "KRRKKRRK",
+        "KRRRRRRK",
+        "KRRRRRRK",
+        "_KRRRRK_",
+        "__KRRK__",
+        "___KK___"
+      ]
+    },
+    "star": {
+      "bg": "Y",
+      "grid": [
+        "___KK___",
+        "___KK___",
+        "KKKKKKKK",
+        "_KYYYYK_",
+        "__KYYK__",
+        "_KYKKYK_",
+        "KYK__KYK",
+        "KK____KK"
+      ]
+    },
+    "flame": {
+      "bg": "O",
+      "grid": [
+        "___K____",
+        "__KRK___",
+        "__KRKK__",
+        "_KORRRK_",
+        "_KOORRK_",
+        "KYOOORK_",
+        "KYYOOK__",
+        "_KKKK___"
+      ]
+    },
+    "diamond": {
+      "bg": "C",
+      "grid": [
+        "___KK___",
+        "__KCCK__",
+        "_KCWCCK_",
+        "KCWCCCCK",
+        "KCCCCCCK",
+        "_KCCCCK_",
+        "__KCCK__",
+        "___KK___"
+      ]
+    },
+    "mushroom": {
+      "bg": "P",
+      "grid": [
+        "__KKKK__",
+        "_KRWWRK_",
+        "KRRWWRRK",
+        "KRRRRRRK",
+        "_KKKKKK_",
+        "__KWWK__",
+        "__KWWK__",
+        "_KKKKKK_"
+      ]
+    },
+    "eye": {
+      "bg": "V",
+      "grid": [
+        "________",
+        "__KKKK__",
+        "_KWWWWK_",
+        "KWWKKWWK",
+        "KWWKKWWK",
+        "_KWWWWK_",
+        "__KKKK__",
+        "________"
+      ]
+    },
+    "crown": {
+      "bg": "Y",
+      "grid": [
+        "________",
+        "_K_KK_K_",
+        "_KKKKKK_",
+        "_KYYYYK_",
+        "_KYYYYK_",
+        "KKKKKKKK",
+        "KYYYYYYK",
+        "KKKKKKKK"
+      ]
+    },
+    "cloud": {
+      "bg": "C",
+      "grid": [
+        "________",
+        "__KK____",
+        "_KWWKK__",
+        "KWWWWWK_",
+        "KWWWWWWK",
+        "KWWWWWWK",
+        "_KKKKKK_",
+        "________"
+      ]
+    },
+    "sun": {
+      "bg": "R",
+      "grid": [
+        "_K_KK_K_",
+        "K_KYYK_K",
+        "_KYYYYK_",
+        "KYYYYYYK",
+        "KYYYYYYK",
+        "_KYYYYK_",
+        "K_KYYK_K",
+        "_K_KK_K_"
+      ]
+    },
+    "bell": {
+      "bg": "B",
+      "grid": [
+        "___KK___",
+        "__KYYK__",
+        "_KYYYYK_",
+        "_KYYYYK_",
+        "_KYYYYK_",
+        "KYYYYYYK",
+        "KKKKKKKK",
+        "___KK___"
+      ]
+    },
+    "tree": {
+      "bg": "L",
+      "grid": [
+        "___KK___",
+        "__KGGK__",
+        "_KGGGGK_",
+        "KGGGGGGK",
+        "KGGGGGGK",
+        "_KKGGKK_",
+        "__KOOK__",
+        "___KK___"
+      ]
+    },
+    "finch": {
+      "bg": "#D7F3FB",
+      "grid": [
+        "__KKKK__",
+        "_KCCCCK_",
+        "KCWCCWCK",
+        "KCKCCKCK",
+        "KCCOOCCK",
+        "_KCCCCK_",
+        "_KCKKCK_",
+        "__K__K__"
+      ]
+    },
+    "mug": {
+      "bg": "#F8EEDF",
+      "grid": [
+        "___KK___",
+        "__K__K__",
+        "KKKKKK__",
+        "KDDDDKKK",
+        "KWDDKK_K",
+        "KDDDDKKK",
+        "KDKKDK__",
+        "_KKKKK__"
+      ]
+    }
+  },
+  "reservedKeys": [
+    "finch",
+    "mug"
+  ],
+  "defaultKey": "robot"
+}

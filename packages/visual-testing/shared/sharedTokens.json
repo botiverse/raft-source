@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "name": "Slock Shared UI Tokens",
+  "colors": {
+    "brutalYellow": "#FFD440",
+    "brutalPink": "#FE7DA8",
+    "brutalLavender": "#BBAFE6",
+    "brutalCream": "#FFFAEF",
+    "brutalBlack": "#141111",
+    "brutalCyan": "#27CCF3",
+    "brutalOrange": "#F8A16F",
+    "brutalLime": "#A9D877",
+    "brutalRed": "#F97264",
+    "brutalStone": "#C0B9B1",
+    "surfaceWhite": "#FFFFFF",
+    "surfaceCream": "#FFFAEF",
+    "appBgLightBlue": "#E6F8FF",
+    "emptyStateGray": "#E7E7E7",
+    "textBlack": "#000000",
+    "textMutedGray": "#737373",
+    "borderBlack": "#000000",
+    "shadowBlack": "#141111"
+  },
+  "font": {
+    "display": "Space Grotesk, system-ui, sans-serif",
+    "mono": "Space Mono, ui-monospace, monospace",
+    "weights": {
+      "regular": 400,
+      "medium": 500,
+      "semibold": 600,
+      "bold": 700
+    }
+  },
+  "shadow": {
+    "brutal": "4px 4px 0px #141111",
+    "brutalSm": "2px 2px 0px #141111",
+    "brutalLg": "6px 6px 0px #141111",
+    "brutalHover": "2px 2px 0px #141111",
+    "brutalActive": "1px 1px 0px #141111",
+    "softPopover": "0 4px 12px rgba(0, 0, 0, 0.08)"
+  },
+  "border": {
+    "thin": "1px",
+    "default": "2px",
+    "strong": "3px",
+    "color": "#141111"
+  },
+  "radius": {
+    "none": "0px",
+    "compact": "4px",
+    "card": "8px"
+  },
+  "spacing": {
+    "xs": "4px",
+    "sm": "8px",
+    "md": "12px",
+    "lg": "16px",
+    "xl": "24px"
+  }
+}

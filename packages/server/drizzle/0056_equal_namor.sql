@@ -1,0 +1,1 @@
+ALTER TABLE "servers" ADD COLUMN "agent_all_channel_greeting_enabled" boolean DEFAULT true NOT NULL;

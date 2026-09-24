@@ -1,0 +1,60 @@
+{
+  "name": "@botiverse/raft-computer",
+  "version": "1.0.28",
+  "license": "FSL-1.1-ALv2",
+  "description": "Canonical Raft Computer — standalone human/local-machine control-plane CLI (login + attach); distinct from the agent-facing @botiverse/raft CLI.",
+  "type": "module",
+  "bin": {
+    "raft-computer": "dist/raft-computer.js"
+  },
+  "exports": {
+    "./lib": {
+      "types": "./dist/lib/index.d.ts",
+      "default": "./dist/lib/index.js"
+    },
+    "./dist/raft-computer.js": "./dist/raft-computer.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/botiverse/raft-source.git",
+    "directory": "packages/computer"
+  },
+  "scripts": {
+    "computer": "tsx src/index.ts",
+    "start": "tsx src/index.ts",
+    "build:deps": "pnpm --filter @botiverse/raft-daemon build",
+    "build": "pnpm run build:deps && tsup && node scripts/write-dist-bins.mjs && node scripts/verify-published-dist.mjs",
+    "build:native": "pnpm run build:deps && node scripts/native/build.mjs",
+    "build:native:windows": "pnpm run build:deps && node scripts/native/build.mjs --platform win32 --arch x64",
+    "manifest:native": "node scripts/native/produce-manifest.mjs",
+    "test": "vitest run",
+    "test:manifest": "node scripts/check-test-manifest.mjs",
+    "typecheck": "tsc --noEmit",
+    "lint:boundaries": "node scripts/check-boundaries.mjs",
+    "lint:naming": "node scripts/check-naming.mjs"
+  },
+  "dependencies": {
+    "@botiverse/hands-node": "0.5.1",
+    "@botiverse/k-carrier": "0.1.8",
+    "@botiverse/raft-daemon": "workspace:*",
+    "commander": "^12.1.0",
+    "proper-lockfile": "^4.1.2",
+    "undici": "^7.24.7"
+  },
+  "devDependencies": {
+    "@botiverse/raft-shared": "workspace:*",
+    "@botiverse/raft-trace-client": "workspace:*",
+    "@types/node": "^25.5.0",
+    "@types/proper-lockfile": "^4.1.4",
+    "esbuild": "^0.25.0",
+    "postject": "^1.0.0-alpha.6",
+    "tsup": "^8.5.1",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3",
+    "vitest": "^2.1.0"
+  }
+}

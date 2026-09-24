@@ -1,0 +1,14 @@
+# Formal macOS release overlay. The base electron-builder.yml stays usable for
+# unsigned local/dev artifacts; this overlay fails closed unless a Developer ID
+# Application identity is present in the job's temporary keychain. Notarization
+# is performed by the reusable sign+notarize workflow, not electron-builder.
+extends: ./electron-builder.yml
+
+mac:
+  forceCodeSigning: true
+  notarize: false
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.inherit.plist
+
+dmg:
+  sign: true

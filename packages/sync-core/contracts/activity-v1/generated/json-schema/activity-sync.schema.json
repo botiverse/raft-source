@@ -1,0 +1,2496 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "activity-sync.schema.json",
+    "$defs": {
+        "ActivityScope": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "ActivityScope.json",
+            "type": "object",
+            "properties": {
+                "serverId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "principalId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "filter": {
+                    "$ref": "ActivityFilter.json"
+                },
+                "windowId": {
+                    "$ref": "OpaqueId.json"
+                }
+            },
+            "required": [
+                "serverId",
+                "principalId",
+                "filter",
+                "windowId"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "OpaqueId": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "OpaqueId.json",
+            "type": "string"
+        },
+        "ActivityFilter": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "ActivityFilter.json",
+            "type": "string",
+            "enum": [
+                "all",
+                "unread",
+                "mentions"
+            ]
+        },
+        "ActivityRowCommon": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "ActivityRowCommon.json",
+            "type": "object",
+            "properties": {
+                "rowId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "rowVersion": {
+                    "$ref": "UInt64String.json"
+                },
+                "latestActivitySeq": {
+                    "$ref": "UInt64String.json",
+                    "description": "Authoritative content-frontier message seq (DB bigint canonical decimal string).\nThe Done/read/reactivation marker authority — replyCount is display-only and must\nnever veto it (task #361 three-axis contract). Required non-null: every row kind\ncarries it same-source (thread = latest reply seq, zero-reply = parent seq; channel/dm\n= last message seq; mention = mention seq). Canonical decimal string, no leading zeros,\nsafe up to 2^53."
+                },
+                "lastActivityAt": {
+                    "$ref": "UtcInstantString.json"
+                },
+                "unreadCount": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 4294967295
+                },
+                "hasMention": {
+                    "type": "boolean"
+                },
+                "firstUnreadMessageId": {
+                    "anyOf": [
+                        {
+                            "$ref": "OpaqueId.json"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ]
+                },
+                "firstMentionMessageId": {
+                    "anyOf": [
+                        {
+                            "$ref": "OpaqueId.json"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ]
+                },
+                "maxReadSeq": {
+                    "$ref": "UInt64String.json"
+                },
+                "readStateVersion": {
+                    "$ref": "UInt64String.json"
+                }
+            },
+            "required": [
+                "rowId",
+                "rowVersion",
+                "latestActivitySeq",
+                "lastActivityAt",
+                "unreadCount",
+                "hasMention",
+                "firstUnreadMessageId",
+                "firstMentionMessageId",
+                "maxReadSeq",
+                "readStateVersion"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "UInt64String": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "UInt64String.json",
+            "type": "string",
+            "pattern": "^(0|[1-9][0-9]*)$"
+        },
+        "UtcInstantString": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "UtcInstantString.json",
+            "type": "string"
+        },
+        "ChannelActivityRow": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "ChannelActivityRow.json",
+            "type": "object",
+            "properties": {
+                "rowId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "rowVersion": {
+                    "$ref": "UInt64String.json"
+                },
+                "latestActivitySeq": {
+                    "$ref": "UInt64String.json",
+                    "description": "Authoritative content-frontier message seq (DB bigint canonical decimal string).\nThe Done/read/reactivation marker authority — replyCount is display-only and must\nnever veto it (task #361 three-axis contract). Required non-null: every row kind\ncarries it same-source (thread = latest reply seq, zero-reply = parent seq; channel/dm\n= last message seq; mention = mention seq). Canonical decimal string, no leading zeros,\nsafe up to 2^53."
+                },
+                "lastActivityAt": {
+                    "$ref": "UtcInstantString.json"
+                },
+                "unreadCount": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 4294967295
+                },
+                "hasMention": {
+                    "type": "boolean"
+                },
+                "firstUnreadMessageId": {
+                    "anyOf": [
+                        {
+                            "$ref": "OpaqueId.json"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ]
+                },
+                "firstMentionMessageId": {
+                    "anyOf": [
+                        {
+                            "$ref": "OpaqueId.json"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ]
+                },
+                "maxReadSeq": {
+                    "$ref": "UInt64String.json"
+                },
+                "readStateVersion": {
+                    "$ref": "UInt64String.json"
+                },
+                "type": {
+                    "type": "string",
+                    "const": "channel"
+                },
+                "channelId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "channelName": {
+                    "type": "string"
+                },
+                "channelKind": {
+                    "anyOf": [
+                        {
+                            "type": "string",
+                            "const": "channel"
+                        },
+                        {
+                            "type": "string",
+                            "const": "private"
+                        },
+                        {
+                            "type": "string",
+                            "const": "joint"
+                        }
+                    ]
+                },
+                "lastMessageId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "lastMessagePreview": {
+                    "type": "string"
+                },
+                "lastMessageSenderKind": {
+                    "$ref": "ActorKind.json"
+                },
+                "lastMessageSenderId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "lastMessageSenderName": {
+                    "anyOf": [
+                        {
+                            "type": "string"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ]
+                }
+            },
+            "required": [
+                "rowId",
+                "rowVersion",
+                "latestActivitySeq",
+                "lastActivityAt",
+                "unreadCount",
+                "hasMention",
+                "firstUnreadMessageId",
+                "firstMentionMessageId",
+                "maxReadSeq",
+                "readStateVersion",
+                "type",
+                "channelId",
+                "channelName",
+                "channelKind",
+                "lastMessageId",
+                "lastMessagePreview",
+                "lastMessageSenderKind",
+                "lastMessageSenderId",
+                "lastMessageSenderName"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "ActorKind": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "ActorKind.json",
+            "type": "string",
+            "enum": [
+                "user",
+                "agent",
+                "system",
+                "external_projection"
+            ]
+        },
+        "DmActivityRow": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "DmActivityRow.json",
+            "type": "object",
+            "properties": {
+                "rowId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "rowVersion": {
+                    "$ref": "UInt64String.json"
+                },
+                "latestActivitySeq": {
+                    "$ref": "UInt64String.json",
+                    "description": "Authoritative content-frontier message seq (DB bigint canonical decimal string).\nThe Done/read/reactivation marker authority — replyCount is display-only and must\nnever veto it (task #361 three-axis contract). Required non-null: every row kind\ncarries it same-source (thread = latest reply seq, zero-reply = parent seq; channel/dm\n= last message seq; mention = mention seq). Canonical decimal string, no leading zeros,\nsafe up to 2^53."
+                },
+                "lastActivityAt": {
+                    "$ref": "UtcInstantString.json"
+                },
+                "unreadCount": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 4294967295
+                },
+                "hasMention": {
+                    "type": "boolean"
+                },
+                "firstUnreadMessageId": {
+                    "anyOf": [
+                        {
+                            "$ref": "OpaqueId.json"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ]
+                },
+                "firstMentionMessageId": {
+                    "anyOf": [
+                        {
+                            "$ref": "OpaqueId.json"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ]
+                },
+                "maxReadSeq": {
+                    "$ref": "UInt64String.json"
+                },
+                "readStateVersion": {
+                    "$ref": "UInt64String.json"
+                },
+                "type": {
+                    "type": "string",
+                    "const": "dm"
+                },
+                "channelId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "channelName": {
+                    "type": "string"
+                },
+                "channelKind": {
+                    "type": "string",
+                    "const": "dm"
+                },
+                "lastMessageId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "lastMessagePreview": {
+                    "type": "string"
+                },
+                "lastMessageSenderKind": {
+                    "$ref": "ActorKind.json"
+                },
+                "lastMessageSenderId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "lastMessageSenderName": {
+                    "anyOf": [
+                        {
+                            "type": "string"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ]
+                }
+            },
+            "required": [
+                "rowId",
+                "rowVersion",
+                "latestActivitySeq",
+                "lastActivityAt",
+                "unreadCount",
+                "hasMention",
+                "firstUnreadMessageId",
+                "firstMentionMessageId",
+                "maxReadSeq",
+                "readStateVersion",
+                "type",
+                "channelId",
+                "channelName",
+                "channelKind",
+                "lastMessageId",
+                "lastMessagePreview",
+                "lastMessageSenderKind",
+                "lastMessageSenderId",
+                "lastMessageSenderName"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "ThreadActivityRow": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "ThreadActivityRow.json",
+            "type": "object",
+            "properties": {
+                "rowId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "rowVersion": {
+                    "$ref": "UInt64String.json"
+                },
+                "latestActivitySeq": {
+                    "$ref": "UInt64String.json",
+                    "description": "Authoritative content-frontier message seq (DB bigint canonical decimal string).\nThe Done/read/reactivation marker authority — replyCount is display-only and must\nnever veto it (task #361 three-axis contract). Required non-null: every row kind\ncarries it same-source (thread = latest reply seq, zero-reply = parent seq; channel/dm\n= last message seq; mention = mention seq). Canonical decimal string, no leading zeros,\nsafe up to 2^53."
+                },
+                "lastActivityAt": {
+                    "$ref": "UtcInstantString.json"
+                },
+                "unreadCount": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 4294967295
+                },
+                "hasMention": {
+                    "type": "boolean"
+                },
+                "firstUnreadMessageId": {
+                    "anyOf": [
+                        {
+                            "$ref": "OpaqueId.json"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ]
+                },
+                "firstMentionMessageId": {
+                    "anyOf": [
+                        {
+                            "$ref": "OpaqueId.json"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ]
+                },
+                "maxReadSeq": {
+                    "$ref": "UInt64String.json"
+                },
+                "readStateVersion": {
+                    "$ref": "UInt64String.json"
+                },
+                "type": {
+                    "type": "string",
+                    "const": "thread"
+                },
+                "threadChannelId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "parentMessageId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "parentChannelId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "parentChannelName": {
+                    "type": "string"
+                },
+                "parentChannelKind": {
+                    "$ref": "ChannelKind.json"
+                },
+                "parentMessagePreview": {
+                    "type": "string"
+                },
+                "parentMessageSenderKind": {
+                    "anyOf": [
+                        {
+                            "type": "string",
+                            "const": "user"
+                        },
+                        {
+                            "type": "string",
+                            "const": "agent"
+                        },
+                        {
+                            "type": "string",
+                            "const": "external_projection"
+                        }
+                    ]
+                },
+                "parentMessageSenderId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "latestActivityPreview": {
+                    "type": "string"
+                },
+                "latestActivitySenderKind": {
+                    "$ref": "ActorKind.json"
+                },
+                "latestActivitySenderId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "latestActivitySenderName": {
+                    "anyOf": [
+                        {
+                            "type": "string"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ]
+                },
+                "latestActivityMessageId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "isFollowing": {
+                    "type": "boolean",
+                    "description": "Follow state affects controls and attention only. Unfollowed rows remain\nin the All feed while not Done, with unreadCount=0 and hasMention=false."
+                },
+                "replyCount": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 4294967295
+                },
+                "lastReplyAt": {
+                    "anyOf": [
+                        {
+                            "$ref": "UtcInstantString.json"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ]
+                },
+                "taskNumber": {
+                    "anyOf": [
+                        {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 4294967295
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ]
+                },
+                "taskStatus": {
+                    "anyOf": [
+                        {
+                            "type": "string"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ]
+                },
+                "taskClaimedByName": {
+                    "anyOf": [
+                        {
+                            "type": "string"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ]
+                }
+            },
+            "required": [
+                "rowId",
+                "rowVersion",
+                "latestActivitySeq",
+                "lastActivityAt",
+                "unreadCount",
+                "hasMention",
+                "firstUnreadMessageId",
+                "firstMentionMessageId",
+                "maxReadSeq",
+                "readStateVersion",
+                "type",
+                "threadChannelId",
+                "parentMessageId",
+                "parentChannelId",
+                "parentChannelName",
+                "parentChannelKind",
+                "parentMessagePreview",
+                "parentMessageSenderKind",
+                "parentMessageSenderId",
+                "latestActivityPreview",
+                "latestActivitySenderKind",
+                "latestActivitySenderId",
+                "latestActivitySenderName",
+                "latestActivityMessageId",
+                "isFollowing",
+                "replyCount",
+                "lastReplyAt",
+                "taskNumber",
+                "taskStatus",
+                "taskClaimedByName"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "ChannelKind": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "ChannelKind.json",
+            "type": "string",
+            "enum": [
+                "channel",
+                "private",
+                "joint",
+                "dm"
+            ]
+        },
+        "ActivityRowTombstone": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "ActivityRowTombstone.json",
+            "type": "object",
+            "properties": {
+                "rowId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "rowVersion": {
+                    "$ref": "UInt64String.json"
+                },
+                "reason": {
+                    "$ref": "TombstoneReason.json"
+                }
+            },
+            "required": [
+                "rowId",
+                "rowVersion",
+                "reason"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "TombstoneReason": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "TombstoneReason.json",
+            "type": "string",
+            "enum": [
+                "done",
+                "deleted",
+                "outOfWindow"
+            ]
+        },
+        "ActivityWindow": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "ActivityWindow.json",
+            "type": "object",
+            "properties": {
+                "rows": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "ActivityRow.json"
+                    }
+                },
+                "tombstones": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "ActivityRowTombstone.json"
+                    }
+                },
+                "nextCursor": {
+                    "anyOf": [
+                        {
+                            "type": "string"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ]
+                },
+                "hasMore": {
+                    "type": "boolean"
+                },
+                "complete": {
+                    "type": "boolean"
+                },
+                "totalCount": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 4294967295
+                },
+                "totalUnreadCount": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 4294967295
+                }
+            },
+            "required": [
+                "rows",
+                "tombstones",
+                "nextCursor",
+                "hasMore",
+                "complete",
+                "totalCount",
+                "totalUnreadCount"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "ActivityRow": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "ActivityRow.json",
+            "oneOf": [
+                {
+                    "$ref": "ChannelActivityRow.json"
+                },
+                {
+                    "$ref": "DmActivityRow.json"
+                },
+                {
+                    "$ref": "ThreadActivityRow.json"
+                }
+            ]
+        },
+        "AffectedReadState": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "AffectedReadState.json",
+            "type": "object",
+            "properties": {
+                "scopeId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "channelId": {
+                    "anyOf": [
+                        {
+                            "$ref": "OpaqueId.json"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ]
+                },
+                "maxReadSeq": {
+                    "$ref": "UInt64String.json"
+                },
+                "readStateVersion": {
+                    "$ref": "UInt64String.json"
+                }
+            },
+            "required": [
+                "scopeId",
+                "channelId",
+                "maxReadSeq",
+                "readStateVersion"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "ActivityCommandReceipt": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "ActivityCommandReceipt.json",
+            "type": "object",
+            "properties": {
+                "commandId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "applied": {
+                    "type": "boolean"
+                },
+                "activityVersion": {
+                    "$ref": "UInt64String.json"
+                },
+                "affectedScopes": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "AffectedReadState.json"
+                    }
+                },
+                "tombstones": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "ActivityRowTombstone.json"
+                    }
+                }
+            },
+            "required": [
+                "commandId",
+                "applied",
+                "activityVersion",
+                "affectedScopes",
+                "tombstones"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            },
+            "description": "FUTURE (V2) — not returned by any V1 route.\n\nKept as frozen vocabulary so the V2 command protocol has a stable shape, and\nso the ingress union can carry a receipt once the server emits one. Attaching\nit to a V1 200 response is what made the contract lie; do not re-attach it\nwithout a route that actually returns it."
+        },
+        "ContractError": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "ContractError.json",
+            "type": "object",
+            "properties": {
+                "code": {
+                    "$ref": "ContractErrorCode.json"
+                },
+                "message": {
+                    "type": "string"
+                },
+                "retryable": {
+                    "type": "boolean"
+                }
+            },
+            "required": [
+                "code",
+                "message",
+                "retryable"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "ContractErrorCode": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "ContractErrorCode.json",
+            "type": "string",
+            "enum": [
+                "invalidRequest",
+                "staleVersion",
+                "unauthorized",
+                "forbidden",
+                "conflict",
+                "unavailable",
+                "internal"
+            ]
+        },
+        "SnapshotIngress": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "SnapshotIngress.json",
+            "type": "object",
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "const": "snapshot"
+                },
+                "requestId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "scope": {
+                    "$ref": "ActivityScope.json"
+                },
+                "epoch": {
+                    "$ref": "UInt64String.json"
+                },
+                "watermark": {
+                    "$ref": "UInt64String.json"
+                },
+                "activityVersion": {
+                    "$ref": "UInt64String.json"
+                },
+                "window": {
+                    "$ref": "ActivityWindow.json"
+                }
+            },
+            "required": [
+                "type",
+                "requestId",
+                "scope",
+                "epoch",
+                "watermark",
+                "activityVersion",
+                "window"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "NotModifiedIngress": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "NotModifiedIngress.json",
+            "type": "object",
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "const": "notModified"
+                },
+                "requestId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "scope": {
+                    "$ref": "ActivityScope.json"
+                },
+                "epoch": {
+                    "$ref": "UInt64String.json"
+                },
+                "watermark": {
+                    "$ref": "UInt64String.json"
+                },
+                "activityVersion": {
+                    "$ref": "UInt64String.json"
+                }
+            },
+            "required": [
+                "type",
+                "requestId",
+                "scope",
+                "epoch",
+                "watermark",
+                "activityVersion"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "DifferenceIngress": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "DifferenceIngress.json",
+            "type": "object",
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "const": "difference"
+                },
+                "requestId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "scope": {
+                    "$ref": "ActivityScope.json"
+                },
+                "epoch": {
+                    "$ref": "UInt64String.json"
+                },
+                "fromSeq": {
+                    "$ref": "UInt64String.json"
+                },
+                "toSeq": {
+                    "$ref": "UInt64String.json"
+                },
+                "activityVersion": {
+                    "$ref": "UInt64String.json"
+                },
+                "rows": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "ActivityRow.json"
+                    }
+                },
+                "tombstones": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "ActivityRowTombstone.json"
+                    }
+                },
+                "nextCursor": {
+                    "anyOf": [
+                        {
+                            "type": "string"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ]
+                },
+                "hasMore": {
+                    "type": "boolean"
+                },
+                "complete": {
+                    "type": "boolean"
+                },
+                "totalCount": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 4294967295
+                },
+                "totalUnreadCount": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 4294967295
+                },
+                "nextFromSeq": {
+                    "anyOf": [
+                        {
+                            "$ref": "UInt64String.json"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ]
+                }
+            },
+            "required": [
+                "type",
+                "requestId",
+                "scope",
+                "epoch",
+                "fromSeq",
+                "toSeq",
+                "activityVersion",
+                "rows",
+                "tombstones",
+                "nextCursor",
+                "hasMore",
+                "complete",
+                "totalCount",
+                "totalUnreadCount",
+                "nextFromSeq"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "FrameIngress": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "FrameIngress.json",
+            "type": "object",
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "const": "frame"
+                },
+                "scope": {
+                    "$ref": "ActivityScope.json"
+                },
+                "epoch": {
+                    "$ref": "UInt64String.json"
+                },
+                "seq": {
+                    "$ref": "UInt64String.json"
+                },
+                "activityVersion": {
+                    "$ref": "UInt64String.json"
+                },
+                "rows": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "ActivityRow.json"
+                    }
+                },
+                "tombstones": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "ActivityRowTombstone.json"
+                    }
+                }
+            },
+            "required": [
+                "type",
+                "scope",
+                "epoch",
+                "seq",
+                "activityVersion",
+                "rows",
+                "tombstones"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "CommandReceiptIngress": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "CommandReceiptIngress.json",
+            "type": "object",
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "const": "commandReceipt"
+                },
+                "scope": {
+                    "$ref": "ActivityScope.json"
+                },
+                "receipt": {
+                    "$ref": "ActivityCommandReceipt.json"
+                }
+            },
+            "required": [
+                "type",
+                "scope",
+                "receipt"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "CommandRejectedIngress": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "CommandRejectedIngress.json",
+            "type": "object",
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "const": "commandRejected"
+                },
+                "scope": {
+                    "$ref": "ActivityScope.json"
+                },
+                "commandId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "activityVersion": {
+                    "anyOf": [
+                        {
+                            "$ref": "UInt64String.json"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ]
+                },
+                "error": {
+                    "$ref": "ContractError.json"
+                }
+            },
+            "required": [
+                "type",
+                "scope",
+                "commandId",
+                "activityVersion",
+                "error"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "ReadStateUpdatedIngress": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "ReadStateUpdatedIngress.json",
+            "type": "object",
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "const": "readStateUpdated"
+                },
+                "scope": {
+                    "$ref": "ActivityScope.json"
+                },
+                "epoch": {
+                    "$ref": "UInt64String.json"
+                },
+                "seq": {
+                    "$ref": "UInt64String.json"
+                },
+                "activityVersion": {
+                    "$ref": "UInt64String.json"
+                },
+                "updates": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "AffectedReadState.json"
+                    }
+                }
+            },
+            "required": [
+                "type",
+                "scope",
+                "epoch",
+                "seq",
+                "activityVersion",
+                "updates"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "EnsureWindowIntent": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "EnsureWindowIntent.json",
+            "type": "object",
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "const": "ensureWindow"
+                },
+                "scope": {
+                    "$ref": "ActivityScope.json"
+                }
+            },
+            "required": [
+                "type",
+                "scope"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "RefreshIntent": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "RefreshIntent.json",
+            "type": "object",
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "const": "refresh"
+                },
+                "scope": {
+                    "$ref": "ActivityScope.json"
+                }
+            },
+            "required": [
+                "type",
+                "scope"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "LoadMoreIntent": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "LoadMoreIntent.json",
+            "type": "object",
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "const": "loadMore"
+                },
+                "scope": {
+                    "$ref": "ActivityScope.json"
+                },
+                "cursor": {
+                    "type": "string"
+                }
+            },
+            "required": [
+                "type",
+                "scope",
+                "cursor"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "MarkChannelReadAllIntent": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "MarkChannelReadAllIntent.json",
+            "type": "object",
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "const": "markChannelReadAll"
+                },
+                "scope": {
+                    "$ref": "ActivityScope.json"
+                },
+                "commandId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "channelId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "throughSeq": {
+                    "$ref": "UInt64String.json"
+                }
+            },
+            "required": [
+                "type",
+                "scope",
+                "commandId",
+                "channelId",
+                "throughSeq"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "MarkInboxReadAllIntent": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "MarkInboxReadAllIntent.json",
+            "type": "object",
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "const": "markInboxReadAll"
+                },
+                "scope": {
+                    "$ref": "ActivityScope.json"
+                },
+                "commandId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "throughSeq": {
+                    "$ref": "UInt64String.json"
+                }
+            },
+            "required": [
+                "type",
+                "scope",
+                "commandId",
+                "throughSeq"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "MarkThreadDoneIntent": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "MarkThreadDoneIntent.json",
+            "type": "object",
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "const": "markThreadDone"
+                },
+                "scope": {
+                    "$ref": "ActivityScope.json"
+                },
+                "commandId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "threadChannelId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "throughActivitySeq": {
+                    "$ref": "UInt64String.json",
+                    "description": "Authoritative content-frontier seq this Done covers. Monotonic write:\nmust be a positive canonical decimal string (`0` is invalid);\nserver sets doneThrough = max(existing, throughActivitySeq) and rejects\nthroughActivitySeq > currentLatest with 409 + zero write (never clamps).\nReplaces the strict-CAS expectedRowVersion (task #361 Gate B2)."
+                }
+            },
+            "required": [
+                "type",
+                "scope",
+                "commandId",
+                "threadChannelId",
+                "throughActivitySeq"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "MarkInboxDoneIntent": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "MarkInboxDoneIntent.json",
+            "type": "object",
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "const": "markInboxDone"
+                },
+                "scope": {
+                    "$ref": "ActivityScope.json"
+                },
+                "commandId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "rowId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "throughActivitySeq": {
+                    "$ref": "UInt64String.json",
+                    "description": "Authoritative content-frontier seq this Done covers. Monotonic write:\nmust be a positive canonical decimal string (`0` is invalid);\nserver sets doneThrough = max(existing, throughActivitySeq) and rejects\nthroughActivitySeq > currentLatest with 409 + zero write (never clamps).\nReplaces the strict-CAS expectedRowVersion (task #361 Gate B2)."
+                }
+            },
+            "required": [
+                "type",
+                "scope",
+                "commandId",
+                "rowId",
+                "throughActivitySeq"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "ActivityScopeState": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "ActivityScopeState.json",
+            "type": "object",
+            "properties": {
+                "scope": {
+                    "$ref": "ActivityScope.json"
+                },
+                "epoch": {
+                    "anyOf": [
+                        {
+                            "$ref": "UInt64String.json"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ]
+                },
+                "watermark": {
+                    "anyOf": [
+                        {
+                            "$ref": "UInt64String.json"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ]
+                },
+                "activityVersion": {
+                    "anyOf": [
+                        {
+                            "$ref": "UInt64String.json"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ]
+                },
+                "revision": {
+                    "$ref": "UInt64String.json"
+                },
+                "syncState": {
+                    "$ref": "ActivitySyncState.json"
+                },
+                "window": {
+                    "$ref": "ActivityWindow.json"
+                }
+            },
+            "required": [
+                "scope",
+                "epoch",
+                "watermark",
+                "activityVersion",
+                "revision",
+                "syncState",
+                "window"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "ActivitySyncState": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "ActivitySyncState.json",
+            "type": "string",
+            "enum": [
+                "empty",
+                "loading",
+                "ready",
+                "stale",
+                "recovering"
+            ]
+        },
+        "FixtureInitialState": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "FixtureInitialState.json",
+            "type": "object",
+            "properties": {
+                "scopes": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "ActivityScopeState.json"
+                    }
+                }
+            },
+            "required": [
+                "scopes"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "IngestFixtureStep": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "IngestFixtureStep.json",
+            "type": "object",
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "const": "ingest"
+                },
+                "stepId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "ingress": {
+                    "$ref": "ActivityIngress.json"
+                }
+            },
+            "required": [
+                "type",
+                "stepId",
+                "ingress"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "ActivityIngress": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "ActivityIngress.json",
+            "oneOf": [
+                {
+                    "$ref": "SnapshotIngress.json"
+                },
+                {
+                    "$ref": "NotModifiedIngress.json"
+                },
+                {
+                    "$ref": "DifferenceIngress.json"
+                },
+                {
+                    "$ref": "FrameIngress.json"
+                },
+                {
+                    "$ref": "CommandReceiptIngress.json"
+                },
+                {
+                    "$ref": "CommandRejectedIngress.json"
+                },
+                {
+                    "$ref": "ReadStateUpdatedIngress.json"
+                }
+            ]
+        },
+        "DispatchFixtureStep": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "DispatchFixtureStep.json",
+            "type": "object",
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "const": "dispatch"
+                },
+                "stepId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "intent": {
+                    "$ref": "ActivityIntent.json"
+                }
+            },
+            "required": [
+                "type",
+                "stepId",
+                "intent"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "ActivityIntent": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "ActivityIntent.json",
+            "oneOf": [
+                {
+                    "$ref": "EnsureWindowIntent.json"
+                },
+                {
+                    "$ref": "RefreshIntent.json"
+                },
+                {
+                    "$ref": "LoadMoreIntent.json"
+                },
+                {
+                    "$ref": "MarkChannelReadAllIntent.json"
+                },
+                {
+                    "$ref": "MarkInboxReadAllIntent.json"
+                },
+                {
+                    "$ref": "MarkThreadDoneIntent.json"
+                },
+                {
+                    "$ref": "MarkInboxDoneIntent.json"
+                }
+            ]
+        },
+        "CheckpointFixtureStep": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "CheckpointFixtureStep.json",
+            "type": "object",
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "const": "checkpoint"
+                },
+                "stepId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "checkpointId": {
+                    "$ref": "OpaqueId.json"
+                }
+            },
+            "required": [
+                "type",
+                "stepId",
+                "checkpointId"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "RestartFixtureStep": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "RestartFixtureStep.json",
+            "type": "object",
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "const": "restart"
+                },
+                "stepId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "mode": {
+                    "anyOf": [
+                        {
+                            "type": "string",
+                            "const": "cold"
+                        },
+                        {
+                            "type": "string",
+                            "const": "persisted"
+                        }
+                    ]
+                }
+            },
+            "required": [
+                "type",
+                "stepId",
+                "mode"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "ActivityFixtureEnvelope": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "ActivityFixtureEnvelope.json",
+            "type": "object",
+            "properties": {
+                "contract": {
+                    "type": "string",
+                    "const": "raft.activity-sync"
+                },
+                "contractVersion": {
+                    "type": "number",
+                    "const": 1
+                },
+                "runnerProtocol": {
+                    "type": "number",
+                    "const": 1
+                },
+                "status": {
+                    "type": "string",
+                    "const": "experimental"
+                },
+                "caseId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "description": {
+                    "type": "string"
+                },
+                "initialState": {
+                    "$ref": "FixtureInitialState.json"
+                },
+                "steps": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "ActivityFixtureStep.json"
+                    }
+                }
+            },
+            "required": [
+                "contract",
+                "contractVersion",
+                "runnerProtocol",
+                "status",
+                "caseId",
+                "description",
+                "initialState",
+                "steps"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "ActivityFixtureStep": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "ActivityFixtureStep.json",
+            "oneOf": [
+                {
+                    "$ref": "IngestFixtureStep.json"
+                },
+                {
+                    "$ref": "DispatchFixtureStep.json"
+                },
+                {
+                    "$ref": "CheckpointFixtureStep.json"
+                },
+                {
+                    "$ref": "RestartFixtureStep.json"
+                }
+            ]
+        },
+        "ContractVectorExpectation": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "ContractVectorExpectation.json",
+            "type": "object",
+            "properties": {
+                "validator": {
+                    "$ref": "ContractVerdict.json"
+                },
+                "typescriptStatic": {
+                    "$ref": "ContractVerdict.json"
+                },
+                "kotlinRuntime": {
+                    "$ref": "ContractVerdict.json"
+                }
+            },
+            "required": [
+                "validator",
+                "typescriptStatic",
+                "kotlinRuntime"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "ContractVerdict": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "ContractVerdict.json",
+            "type": "string",
+            "enum": [
+                "accept",
+                "reject",
+                "exempt"
+            ]
+        },
+        "ContractVectorEnvelope": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "ContractVectorEnvelope.json",
+            "type": "object",
+            "properties": {
+                "vectorId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "constraintClass": {
+                    "$ref": "ConstraintClass.json"
+                },
+                "candidate": {},
+                "expectation": {
+                    "$ref": "ContractVectorExpectation.json"
+                },
+                "reason": {
+                    "type": "string"
+                }
+            },
+            "required": [
+                "vectorId",
+                "constraintClass",
+                "candidate",
+                "expectation",
+                "reason"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "ConstraintClass": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "ConstraintClass.json",
+            "type": "string",
+            "enum": [
+                "positive",
+                "structural",
+                "valueDomain"
+            ]
+        },
+        "InboxQuery": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "InboxQuery.json",
+            "type": "object",
+            "properties": {
+                "filter": {
+                    "$ref": "ActivityFilter.json"
+                },
+                "cursor": {
+                    "type": "string"
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 4294967295
+                },
+                "epoch": {
+                    "$ref": "UInt64String.json"
+                },
+                "activityVersion": {
+                    "$ref": "UInt64String.json"
+                }
+            },
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "CommandRequest": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "CommandRequest.json",
+            "type": "object",
+            "properties": {
+                "commandId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "expectedActivityVersion": {
+                    "$ref": "UInt64String.json"
+                }
+            },
+            "required": [
+                "commandId",
+                "expectedActivityVersion"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "MarkChannelReadAllRequest": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "MarkChannelReadAllRequest.json",
+            "type": "object",
+            "properties": {
+                "commandId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "expectedActivityVersion": {
+                    "$ref": "UInt64String.json"
+                },
+                "throughSeq": {
+                    "$ref": "UInt64String.json"
+                }
+            },
+            "required": [
+                "commandId",
+                "expectedActivityVersion",
+                "throughSeq"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "MarkInboxReadAllRequest": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "MarkInboxReadAllRequest.json",
+            "type": "object",
+            "properties": {
+                "commandId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "expectedActivityVersion": {
+                    "$ref": "UInt64String.json"
+                },
+                "throughSeq": {
+                    "$ref": "UInt64String.json"
+                }
+            },
+            "required": [
+                "commandId",
+                "expectedActivityVersion",
+                "throughSeq"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "BadRequestResponse": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "BadRequestResponse.json",
+            "type": "object",
+            "properties": {
+                "statusCode": {
+                    "type": "number",
+                    "const": 400
+                },
+                "body": {
+                    "$ref": "ContractError.json"
+                }
+            },
+            "required": [
+                "statusCode",
+                "body"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "UnauthorizedResponse": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "UnauthorizedResponse.json",
+            "type": "object",
+            "properties": {
+                "statusCode": {
+                    "type": "number",
+                    "const": 401
+                },
+                "body": {
+                    "$ref": "ContractError.json"
+                }
+            },
+            "required": [
+                "statusCode",
+                "body"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "ForbiddenResponse": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "ForbiddenResponse.json",
+            "type": "object",
+            "properties": {
+                "statusCode": {
+                    "type": "number",
+                    "const": 403
+                },
+                "body": {
+                    "$ref": "ContractError.json"
+                }
+            },
+            "required": [
+                "statusCode",
+                "body"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "ConflictResponse": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "ConflictResponse.json",
+            "type": "object",
+            "properties": {
+                "statusCode": {
+                    "type": "number",
+                    "const": 409
+                },
+                "body": {
+                    "$ref": "ContractError.json"
+                }
+            },
+            "required": [
+                "statusCode",
+                "body"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "NotFoundResponse": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "NotFoundResponse.json",
+            "type": "object",
+            "properties": {
+                "statusCode": {
+                    "type": "number",
+                    "const": 404
+                },
+                "body": {
+                    "$ref": "ContractError.json"
+                }
+            },
+            "required": [
+                "statusCode",
+                "body"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            },
+            "description": "The server fail-closes with 404 rather than 403 for scope/permission\nfailures, so an unauthorized caller cannot probe existence. Verified against\nthe live routes (\"Thread not found\" / \"Chat not found\"), and it is the status"
+        },
+        "UnavailableResponse": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "UnavailableResponse.json",
+            "type": "object",
+            "properties": {
+                "statusCode": {
+                    "type": "number",
+                    "const": 503
+                },
+                "body": {
+                    "$ref": "ContractError.json"
+                }
+            },
+            "required": [
+                "statusCode",
+                "body"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "V1MarkInboxDoneRequest": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "V1MarkInboxDoneRequest.json",
+            "type": "object",
+            "properties": {
+                "channelId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "throughActivitySeq": {
+                    "$ref": "UInt64String.json",
+                    "description": "Positive canonical decimal content frontier; `0` is invalid."
+                },
+                "frontierSpace": {
+                    "type": "string",
+                    "const": "storage",
+                    "description": "Sequence-space identity required before the strict Done guard runs."
+                }
+            },
+            "required": [
+                "channelId",
+                "throughActivitySeq",
+                "frontierSpace"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            },
+            "description": "V1 error body — what every route-level failure actually returns.\n\nThe contract previously declared `ContractError {code,message,retryable}`,\nwhich no route emits. The real shape is a single `error` string; a client\ngenerated from the old contract could not decode a 400/404/500 at all.Real V1 request bodies, taken from the router.\n\nThe contract previously required `commandId`/`expectedActivityVersion`/\n`throughSeq` on all four routes — V2 vocabulary the server never reads —\nwhile omitting the only fields it does read. A client generated from that\nwould have sent the wrong payload to every write route."
+        },
+        "V1MarkThreadDoneRequest": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "V1MarkThreadDoneRequest.json",
+            "type": "object",
+            "properties": {
+                "threadChannelId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "throughActivitySeq": {
+                    "$ref": "UInt64String.json",
+                    "description": "Positive canonical decimal content frontier; `0` is invalid."
+                },
+                "frontierSpace": {
+                    "type": "string",
+                    "const": "storage",
+                    "description": "Sequence-space identity required before the strict Done guard runs."
+                }
+            },
+            "required": [
+                "threadChannelId",
+                "throughActivitySeq",
+                "frontierSpace"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "V1InboxPage": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "V1InboxPage.json",
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {}
+                },
+                "hasMore": {
+                    "type": "boolean"
+                },
+                "totalCount": {
+                    "$ref": "SafeUnsignedCounter.json"
+                },
+                "totalUnreadCount": {
+                    "$ref": "SafeUnsignedCounter.json"
+                },
+                "activeUnreadCount": {
+                    "$ref": "SafeUnsignedCounter.json"
+                }
+            },
+            "required": [
+                "items",
+                "hasMore",
+                "totalCount",
+                "totalUnreadCount",
+                "activeUnreadCount"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            },
+            "description": "Real `GET /api/channels/inbox` page body.\n\nThe contract declared this route as returning the future sync ingress union\n(SnapshotIngress or DifferenceIngress). The live route returns an inbox PAGE.\nThat declaration survived three earlier corrections because the audits\ntargeted the write routes and never questioned the read."
+        },
+        "SafeUnsignedCounter": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "SafeUnsignedCounter.json",
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "Legacy lossy counter: a JSON number trustworthy only within the JS safe-integer range. Bounds are explicit because bare `safeint` emitted an unbounded integer to JSON Schema and `format: int64` to OpenAPI, overstating a range the wire cannot carry."
+        },
+        "V1ErrorBody": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "V1ErrorBody.json",
+            "type": "object",
+            "properties": {
+                "error": {
+                    "type": "string"
+                }
+            },
+            "required": [
+                "error"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "V1DoneBadRequestBody": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "V1DoneBadRequestBody.json",
+            "type": "object",
+            "properties": {
+                "error": {
+                    "type": "string"
+                },
+                "code": {
+                    "type": "string"
+                }
+            },
+            "required": [
+                "error"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            },
+            "description": "Done shares legacy request validation with a machine-readable frontier gate."
+        },
+        "V1DoneConflictBody": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "V1DoneConflictBody.json",
+            "type": "object",
+            "properties": {
+                "error": {
+                    "type": "string"
+                },
+                "code": {
+                    "type": "string"
+                }
+            },
+            "required": [
+                "error",
+                "code"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "V1AuthErrorBody": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "V1AuthErrorBody.json",
+            "type": "object",
+            "properties": {
+                "error": {
+                    "type": "string"
+                },
+                "code": {
+                    "type": "string"
+                }
+            },
+            "required": [
+                "error",
+                "code"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            },
+            "description": "`requireAuth` adds a machine-readable `code` alongside the message."
+        },
+        "V1UnauthorizedResponse": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "V1UnauthorizedResponse.json",
+            "type": "object",
+            "properties": {
+                "statusCode": {
+                    "type": "number",
+                    "const": 401
+                },
+                "body": {
+                    "$ref": "V1AuthErrorBody.json"
+                }
+            },
+            "required": [
+                "statusCode",
+                "body"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "V1ForbiddenResponse": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "V1ForbiddenResponse.json",
+            "type": "object",
+            "properties": {
+                "statusCode": {
+                    "type": "number",
+                    "const": 403
+                },
+                "body": {
+                    "$ref": "V1ErrorBody.json"
+                }
+            },
+            "required": [
+                "statusCode",
+                "body"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "V1BadRequestResponse": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "V1BadRequestResponse.json",
+            "type": "object",
+            "properties": {
+                "statusCode": {
+                    "type": "number",
+                    "const": 400
+                },
+                "body": {
+                    "$ref": "V1ErrorBody.json"
+                }
+            },
+            "required": [
+                "statusCode",
+                "body"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "V1DoneBadRequestResponse": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "V1DoneBadRequestResponse.json",
+            "type": "object",
+            "properties": {
+                "statusCode": {
+                    "type": "number",
+                    "const": 400
+                },
+                "body": {
+                    "$ref": "V1DoneBadRequestBody.json"
+                }
+            },
+            "required": [
+                "statusCode",
+                "body"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "V1ConflictResponse": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "V1ConflictResponse.json",
+            "type": "object",
+            "properties": {
+                "statusCode": {
+                    "type": "number",
+                    "const": 409
+                },
+                "body": {
+                    "$ref": "V1DoneConflictBody.json"
+                }
+            },
+            "required": [
+                "statusCode",
+                "body"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            },
+            "description": "A bounded Done frontier is beyond the target or its active cursor authority."
+        },
+        "V1PreconditionFailedResponse": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "V1PreconditionFailedResponse.json",
+            "type": "object",
+            "properties": {
+                "statusCode": {
+                    "type": "number",
+                    "const": 412
+                },
+                "body": {
+                    "$ref": "V1DoneConflictBody.json"
+                }
+            },
+            "required": [
+                "statusCode",
+                "body"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            },
+            "description": "A pre-upgrade request has no sequence-space identity and must refresh."
+        },
+        "V1NotFoundResponse": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "V1NotFoundResponse.json",
+            "type": "object",
+            "properties": {
+                "statusCode": {
+                    "type": "number",
+                    "const": 404
+                },
+                "body": {
+                    "$ref": "V1ErrorBody.json"
+                }
+            },
+            "required": [
+                "statusCode",
+                "body"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "V1InternalErrorResponse": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "V1InternalErrorResponse.json",
+            "type": "object",
+            "properties": {
+                "statusCode": {
+                    "type": "number",
+                    "const": 500
+                },
+                "body": {
+                    "$ref": "V1ErrorBody.json"
+                }
+            },
+            "required": [
+                "statusCode",
+                "body"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "V1AdmittedResponse": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "V1AdmittedResponse.json",
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string"
+                },
+                "status": {
+                    "type": "string",
+                    "const": "admitted"
+                },
+                "outcome": {
+                    "type": "string",
+                    "const": "unknown"
+                },
+                "mutationId": {
+                    "type": "string"
+                },
+                "authoritySeq": {
+                    "$ref": "SafeUnsignedCounter.json"
+                },
+                "frontierUrl": {
+                    "type": "string"
+                }
+            },
+            "required": [
+                "code",
+                "status",
+                "outcome",
+                "mutationId",
+                "authoritySeq",
+                "frontierUrl"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            },
+            "description": "Real 202 admission outcome (`sendCompatibilityReadPending`).\n\nA compatibility read-mutation may be admitted rather than committed; the\ncaller must poll `frontierUrl`. This existed in production and was entirely\nabsent from the contract, so a generated client had no way to represent\n\"accepted, outcome unknown\" and would treat it as an unexpected status."
+        },
+        "V1AffectedReadState": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "V1AffectedReadState.json",
+            "type": "object",
+            "properties": {
+                "scopeId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "maxReadSeq": {
+                    "$ref": "SafeUnsignedCounter.json"
+                },
+                "readStateVersion": {
+                    "$ref": "SafeUnsignedCounter.json"
+                }
+            },
+            "required": [
+                "scopeId",
+                "maxReadSeq",
+                "readStateVersion"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "V1MarkInboxReadAllResponse": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "V1MarkInboxReadAllResponse.json",
+            "type": "object",
+            "properties": {
+                "ok": {
+                    "type": "boolean",
+                    "const": true,
+                    "description": "Literal: the server only emits this body on success."
+                },
+                "markedCount": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 2147483647
+                },
+                "scopes": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "V1AffectedReadState.json"
+                    }
+                }
+            },
+            "required": [
+                "ok",
+                "markedCount",
+                "scopes"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "V1MarkChannelReadAllResponse": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "V1MarkChannelReadAllResponse.json",
+            "type": "object",
+            "properties": {
+                "ok": {
+                    "type": "boolean",
+                    "const": true
+                },
+                "seq": {
+                    "$ref": "SafeUnsignedCounter.json"
+                },
+                "readStateVersion": {
+                    "$ref": "SafeUnsignedCounter.json"
+                }
+            },
+            "required": [
+                "ok",
+                "seq",
+                "readStateVersion"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        },
+        "V1AckResponse": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "V1AckResponse.json",
+            "type": "object",
+            "properties": {
+                "ok": {
+                    "type": "boolean",
+                    "const": true
+                }
+            },
+            "required": [
+                "ok"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            },
+            "description": "Both `done` routes return only an HTTP-success acknowledgement today."
+        },
+        "SnapshotRequiredBody": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "SnapshotRequiredBody.json",
+            "type": "object",
+            "properties": {
+                "snapshotRequired": {
+                    "type": "boolean",
+                    "const": true
+                },
+                "requestId": {
+                    "$ref": "OpaqueId.json"
+                },
+                "scope": {
+                    "$ref": "ActivityScope.json"
+                },
+                "epoch": {
+                    "$ref": "UInt64String.json"
+                },
+                "watermark": {
+                    "$ref": "UInt64String.json"
+                },
+                "activityVersion": {
+                    "$ref": "UInt64String.json"
+                }
+            },
+            "required": [
+                "snapshotRequired",
+                "requestId",
+                "scope",
+                "epoch",
+                "watermark",
+                "activityVersion"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            },
+            "description": "Explicit repair outcome. A caller with an old epoch, a future watermark, or\na watermark older than the retained dense journal must fetch a snapshot;\nthe server never fabricates continuity."
+        },
+        "SnapshotRequiredResponse": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "SnapshotRequiredResponse.json",
+            "type": "object",
+            "properties": {
+                "statusCode": {
+                    "type": "number",
+                    "const": 409
+                },
+                "body": {
+                    "$ref": "SnapshotRequiredBody.json"
+                }
+            },
+            "required": [
+                "statusCode",
+                "body"
+            ],
+            "unevaluatedProperties": {
+                "not": {}
+            }
+        }
+    }
+}

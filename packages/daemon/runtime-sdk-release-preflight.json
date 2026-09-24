@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "checkedAt": "2026-08-15T20:36:24.311Z",
+  "daemonVersionBeforeBranchCut": "1.0.16",
+  "decision": "hold",
+  "reason": "Preserve the reviewed Pi 0.83.0 pins; 1.0.17 already carries the separately reviewed Kimi 0.34.0 SDK change, and adding a new Pi SDK update would broaden release risk.",
+  "packages": [
+    {
+      "packageName": "@earendil-works/pi-ai",
+      "distTag": "latest",
+      "pinned": "0.83.0",
+      "registry": "0.84.2",
+      "selected": "0.83.0"
+    },
+    {
+      "packageName": "@earendil-works/pi-coding-agent",
+      "distTag": "latest",
+      "pinned": "0.83.0",
+      "registry": "0.84.2",
+      "selected": "0.83.0"
+    },
+    {
+      "packageName": "@botiverse/kimi-code-sdk",
+      "distTag": "botiverse",
+      "pinned": "0.34.0-botiverse.0",
+      "registry": "0.34.0-botiverse.0",
+      "selected": "0.34.0-botiverse.0"
+    }
+  ]
+}

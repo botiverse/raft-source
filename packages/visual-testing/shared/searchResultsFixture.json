@@ -1,0 +1,46 @@
+{
+  "comment": "Canonical /messages/search rows for components.home.search.results (manifest variant filtered-results: query 'android'). Entities and timestamps come from fixtureData.json (channels.design, agents.cindy, humans.owner, times) so React and Android render the same rows. Consumed by the playwright /messages/search route stub (packages/visual-testing/tests/react-provider.spec.ts); the render host does not prime a search store — MessageSearchPage fetches these rows after the capture interaction fills the query (task #351).",
+  "hasMore": false,
+  "results": [
+    {
+      "id": "msg-visual-search-1",
+      "channelId": "channel-design",
+      "threadId": null,
+      "parentMessageId": null,
+      "parentMessageContent": null,
+      "parentChannelId": "channel-design",
+      "parentChannelName": "design",
+      "parentChannelType": "channel",
+      "parentChannelArchivedAt": null,
+      "senderId": "agent-cindy",
+      "senderType": "agent",
+      "senderName": "Cindy",
+      "channelName": "design",
+      "channelType": "channel",
+      "channelArchivedAt": null,
+      "content": "Captured the Android visual artifact for #product:f8e569cb and queued React parity.",
+      "snippet": "Captured the Android visual artifact for #product:f8e569cb and queued React parity.",
+      "createdAt": "2026-06-22T02:30:00.000Z"
+    },
+    {
+      "id": "msg-visual-search-2",
+      "channelId": "thread-msg-agent-reply",
+      "threadId": null,
+      "parentMessageId": "msg-agent-reply",
+      "parentMessageContent": "Captured the Android visual artifact for #product:f8e569cb and queued React parity.",
+      "parentChannelId": "channel-design",
+      "parentChannelName": "design",
+      "parentChannelType": "channel",
+      "parentChannelArchivedAt": null,
+      "senderId": "visual-user",
+      "senderType": "user",
+      "senderName": "artin",
+      "channelName": "design",
+      "channelType": "thread",
+      "channelArchivedAt": null,
+      "content": "Review the Android composer crop before release.",
+      "snippet": "Review the Android composer crop before release.",
+      "createdAt": "2026-06-22T02:35:00.000Z"
+    }
+  ]
+}

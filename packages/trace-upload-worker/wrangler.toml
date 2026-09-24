@@ -1,0 +1,10 @@
+name = "slock-trace-upload-worker"
+main = "src/index.ts"
+compatibility_date = "2026-05-07"
+
+[[r2_buckets]]
+binding = "TRACE_BUNDLES"
+bucket_name = "slock-daemon-trace-bundles"
+
+[vars]
+TRACE_UPLOAD_MAX_BYTES = "52428800"

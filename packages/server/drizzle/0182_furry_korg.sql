@@ -1,0 +1,2 @@
+DROP INDEX "idx_agent_migrations_active_agent";--> statement-breakpoint
+CREATE UNIQUE INDEX "idx_agent_migrations_active_agent" ON "agent_migrations" USING btree ("agent_id") WHERE "agent_migrations"."state" IN ('provisioning', 'prep', 'ready', 'in_transit', 'arriving', 'starting');

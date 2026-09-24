@@ -1,0 +1,94 @@
+diff --git a/core/src/artifact/download.ts b/core/src/artifact/download.ts
+index a1fe25d1418a4a53dbebe05905634210bcd8d914..452f9bf5eac54720ceb061aa546462623e543add 100644
+--- a/core/src/artifact/download.ts
++++ b/core/src/artifact/download.ts
+@@ -32,6 +32,7 @@ import { ArtifactError } from "./errors.ts";
+ import type { Release } from "./source.ts";
+ import { collectStream } from "./collectStream.ts";
+ import { partialPathFor } from "./partialPath.ts";
++import { decodeGzipArtifact } from "./gzip.ts";
+ import type { DownloadOptions } from "./transferPolicy.ts";
+ export { partialPathFor } from "./partialPath.ts";
+ export type { DownloadOptions } from "./transferPolicy.ts";
+@@ -41,6 +42,27 @@ export async function downloadVerified(
+   release: Release,
+   opts: DownloadOptions = {},
+ ): Promise<Uint8Array> {
++  if (release.gzip !== undefined) {
++    const gzip = release.gzip;
++    if (!gzip || typeof gzip.url !== "string" || !gzip.url ||
++        !/^[a-f0-9]{64}$/.test(gzip.sha256) || !Number.isSafeInteger(gzip.size) || gzip.size <= 0 ||
++        !Number.isSafeInteger(release.size) || release.size < 0 ||
++        !/^[a-f0-9]{64}$/.test(release.sha256)) {
++      throw new ArtifactError("MANIFEST_INVALID", "invalid gzip artifact identity");
++    }
++    // Range and partial files refer to compressed bytes, never decoded offsets.
++    const compressed = await downloadVerified({
++      version: release.version, url: gzip.url, size: gzip.size, sha256: gzip.sha256,
++    }, opts);
++    try {
++      return await decodeGzipArtifact(compressed, release);
++    } catch (error) {
++      if (opts.resumeDir) {
++        await fs.rm(partialPathFor(opts.resumeDir, gzip.url), { force: true }).catch(() => {});
++      }
++      throw error;
++    }
++  }
+   const url = release.url;
+   const clock = opts.clock ?? systemClock;
+   const timeoutMs = opts.timeoutMs ?? 10000;
+@@ -147,7 +169,7 @@ async function fetchAndAppend(
+     });
+   };
+   try {
+-    const headers: Record<string, string> = {};
++    const headers: Record<string, string> = { "Accept-Encoding": "identity" };
+     if (partialSize > 0) headers["Range"] = `bytes=${partialSize}-`;
+     let res: Response;
+     armResponse();
+diff --git a/core/src/artifact/gzip.ts b/core/src/artifact/gzip.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..360446fcee3da0a444fafb2d117056e64f23f5fd
+--- /dev/null
++++ b/core/src/artifact/gzip.ts
+@@ -0,0 +1,26 @@
++import { createHash } from "node:crypto";
++import { gunzip } from "node:zlib";
++import { ArtifactError } from "./errors.ts";
++import type { Release } from "./source.ts";
++
++/** Decode only verified transport bytes; bound expansion by the canonical size. */
++export async function decodeGzipArtifact(bytes: Uint8Array, release: Release): Promise<Uint8Array> {
++  let decoded: Uint8Array;
++  try {
++    decoded = await new Promise<Buffer>((resolve, reject) => {
++      gunzip(bytes, { maxOutputLength: Math.max(1, release.size) }, (error, output) => {
++        if (error) reject(error);
++        else resolve(output);
++      });
++    });
++  } catch (cause) {
++    throw new ArtifactError("DOWNLOAD_FAILED", "gzip is invalid or exceeds the declared decoded size", { cause });
++  }
++  if (decoded.length !== release.size) {
++    throw new ArtifactError("SIZE_MISMATCH", "decoded gzip size does not match the release");
++  }
++  if (createHash("sha256").update(decoded).digest("hex") !== release.sha256) {
++    throw new ArtifactError("SHA256_MISMATCH", "decoded gzip SHA-256 does not match the release");
++  }
++  return decoded;
++}
+diff --git a/core/src/artifact/source.ts b/core/src/artifact/source.ts
+index 89b9dfae9b281b42ad2af21ce59112ded1de120a..6fec07dd6fe7699d70347bcb6fc669a682bc25e9 100644
+--- a/core/src/artifact/source.ts
++++ b/core/src/artifact/source.ts
+@@ -39,6 +39,8 @@ export interface Release {
+   url: string;
+   sha256: string;
+   size: number;
++  /** Optional explicit gzip representation. Outer size/hash always describe installed bytes. */
++  gzip?: { url: string; sha256: string; size: number };
+ }
+ 
+ export interface ReleaseSource {

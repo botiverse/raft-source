@@ -1,0 +1,1 @@
+CREATE INDEX "idx_attachments_channel_created_linked" ON "attachments" USING btree ("channel_id","created_at" DESC,"id" DESC) WHERE message_id is not null;

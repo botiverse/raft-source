@@ -1,0 +1,9 @@
+# app.slock.ai — robots.txt
+# The web app is an authenticated SPA with no public content worth indexing.
+# Block all crawlers to prevent share-link pages (/s/{slug}/) and other
+# app routes from appearing in search results.
+#
+# Search engines should index slock.ai (the landing/marketing site) instead.
+
+User-agent: *
+Disallow: /

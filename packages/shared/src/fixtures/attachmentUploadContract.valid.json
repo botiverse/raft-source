@@ -1,0 +1,142 @@
+{
+  "fixtures": [
+    {
+      "operation": "create",
+      "status": 400,
+      "body": {
+        "code": "UPLOAD_INVALID_REQUEST",
+        "message": "The upload request is invalid.",
+        "retryable": false
+      }
+    },
+    {
+      "operation": "create",
+      "status": 403,
+      "body": {
+        "code": "UPLOAD_FORBIDDEN",
+        "message": "The member cannot upload to this channel.",
+        "retryable": false
+      }
+    },
+    {
+      "operation": "create",
+      "status": 409,
+      "body": {
+        "code": "UPLOAD_IDEMPOTENCY_CONFLICT",
+        "message": "The request id was used for a different upload.",
+        "retryable": false
+      }
+    },
+    {
+      "operation": "create",
+      "status": 413,
+      "body": {
+        "code": "UPLOAD_TOO_LARGE",
+        "message": "The attachment exceeds the plan limit.",
+        "retryable": false
+      }
+    },
+    {
+      "operation": "create",
+      "status": 429,
+      "body": {
+        "code": "UPLOAD_RATE_LIMITED",
+        "message": "Too many upload sessions were created.",
+        "retryable": true,
+        "retryAfterMs": 1000
+      }
+    },
+    {
+      "operation": "complete",
+      "status": 403,
+      "body": {
+        "code": "UPLOAD_FORBIDDEN",
+        "message": "The member cannot complete this upload.",
+        "retryable": false
+      }
+    },
+    {
+      "operation": "complete",
+      "status": 404,
+      "body": {
+        "code": "UPLOAD_OBJECT_NOT_FOUND",
+        "message": "The uploaded object is not visible yet.",
+        "retryable": true,
+        "retryAfterMs": 500
+      }
+    },
+    {
+      "operation": "complete",
+      "status": 409,
+      "body": {
+        "code": "UPLOAD_VERIFICATION_IN_PROGRESS",
+        "message": "Verification is already in progress.",
+        "retryable": true,
+        "retryAfterMs": 1000
+      }
+    },
+    {
+      "operation": "complete",
+      "status": 410,
+      "body": {
+        "code": "UPLOAD_SESSION_EXPIRED",
+        "message": "The upload session expired.",
+        "retryable": false
+      }
+    },
+    {
+      "operation": "complete",
+      "status": 422,
+      "body": {
+        "code": "UPLOAD_OBJECT_MISMATCH",
+        "message": "The uploaded object does not match the reservation.",
+        "retryable": false
+      }
+    },
+    {
+      "operation": "cancel",
+      "status": 403,
+      "body": {
+        "code": "UPLOAD_FORBIDDEN",
+        "message": "The member cannot cancel this upload.",
+        "retryable": false
+      }
+    },
+    {
+      "operation": "cancel",
+      "status": 404,
+      "body": {
+        "code": "UPLOAD_SESSION_NOT_FOUND",
+        "message": "The upload session does not exist.",
+        "retryable": false
+      }
+    },
+    {
+      "operation": "cancel",
+      "status": 409,
+      "body": {
+        "code": "ATTACHMENT_ALREADY_CONSUMED",
+        "message": "The completed upload is already attached to a message.",
+        "retryable": false
+      }
+    },
+    {
+      "operation": "status",
+      "status": 403,
+      "body": {
+        "code": "UPLOAD_FORBIDDEN",
+        "message": "The member cannot view this upload.",
+        "retryable": false
+      }
+    },
+    {
+      "operation": "status",
+      "status": 404,
+      "body": {
+        "code": "UPLOAD_SESSION_NOT_FOUND",
+        "message": "The upload session does not exist.",
+        "retryable": false
+      }
+    }
+  ]
+}

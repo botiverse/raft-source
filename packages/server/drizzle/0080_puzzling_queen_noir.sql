@@ -1,0 +1,1 @@
+ALTER TABLE "users" ADD COLUMN "preferred_message_body_font_size" text;

@@ -1,0 +1,338 @@
+{
+  "$comment": [
+    "CROSS-PLATFORM CONFORMANCE VECTORS for the thread-replies latest-N read model.",
+    "Contract: RFC 043 Appendix B §B.10 — getLatestNReplies / listenLatestNReplies.",
+    "",
+    "Web and KMP run THIS SAME FILE (mobile syncs the bytes; a CI gate compares them",
+    "against the canonical copy on slock staging — NOT against a second hardcoded hash,",
+    "which would be a gate with the very blind spot it exists to catch).",
+    "",
+    "FRAME SHAPE: each frame carries the AUTHORITATIVE replyCount from the server",
+    "(thread:updated spreads threadInfo). The model ADOPTS it and never derives it.",
+    "Deriving it (count + 1) double-counts once a reply has been EVICTED from the",
+    "N-window: a window-scoped identity check no longer sees the evicted reply, so a",
+    "replayed frame for it takes the 'new' branch. The window forgets; the server's",
+    "count cannot. Found by @Android-Developer-2 — see evicted_live_reply_replay_is_noop.",
+    "",
+    "The invariants, and why each is silent when broken:",
+    "  1. ORDER BY SEQ — a late frame carries an OLDER seq. A naive unshift promotes a",
+    "     stale reply to 'newest' and the preview lies about what was said last.",
+    "  2. DEDUPE BY IDENTITY against a FIXED seam — never by seq magnitude. A running",
+    "     high-water mark discards a genuinely new reply that merely arrived out of",
+    "     order (9 before 8), and it vanishes forever with no error.",
+    "  3. NO-CHANGE => SAME REFERENCE — a value-only check passes an implementation that",
+    "     rebuilds an equal object every frame, which then re-renders the whole timeline."
+  ],
+  "cap": 3,
+  "cases": [
+    {
+      "name": "late_frame_does_not_lead_the_window",
+      "why": "A frame older than the whole window must not enter it, let alone lead it.",
+      "snapshot": {
+        "replies": [
+          5,
+          6,
+          7
+        ],
+        "replyCount": 7
+      },
+      "frames": [
+        {
+          "seq": 4,
+          "replyCount": 7
+        }
+      ],
+      "expect": {
+        "replies": [
+          5,
+          6,
+          7
+        ],
+        "replyCount": 7,
+        "snapshotSeq": 7,
+        "unchanged": true
+      }
+    },
+    {
+      "name": "in_order_frame_advances_and_evicts_oldest",
+      "snapshot": {
+        "replies": [
+          5,
+          6,
+          7
+        ],
+        "replyCount": 7
+      },
+      "frames": [
+        {
+          "seq": 8,
+          "replyCount": 8
+        }
+      ],
+      "expect": {
+        "replies": [
+          6,
+          7,
+          8
+        ],
+        "replyCount": 8,
+        "snapshotSeq": 7,
+        "unchanged": false
+      }
+    },
+    {
+      "name": "out_of_order_convergence",
+      "why": "THE permutation property. Any arrival order of the same frames must converge to the same window. This is the vector that caught the running-watermark bug.",
+      "snapshot": {
+        "replies": [
+          5
+        ],
+        "replyCount": 5
+      },
+      "frames": [
+        {
+          "seq": 9,
+          "replyCount": 6
+        },
+        {
+          "seq": 8,
+          "replyCount": 7
+        },
+        {
+          "seq": 10,
+          "replyCount": 8
+        }
+      ],
+      "expect": {
+        "replies": [
+          8,
+          9,
+          10
+        ],
+        "replyCount": 8,
+        "snapshotSeq": 5,
+        "unchanged": false
+      }
+    },
+    {
+      "name": "out_of_order_convergence_control_in_order",
+      "why": "Control for the above: the in-order permutation must produce an identical window.",
+      "snapshot": {
+        "replies": [
+          5
+        ],
+        "replyCount": 5
+      },
+      "frames": [
+        {
+          "seq": 8,
+          "replyCount": 6
+        },
+        {
+          "seq": 9,
+          "replyCount": 7
+        },
+        {
+          "seq": 10,
+          "replyCount": 8
+        }
+      ],
+      "expect": {
+        "replies": [
+          8,
+          9,
+          10
+        ],
+        "replyCount": 8,
+        "snapshotSeq": 5,
+        "unchanged": false
+      }
+    },
+    {
+      "name": "reconnect_replay_is_a_no_op",
+      "why": "On reconnect the server replays history. Without the seam these duplicate into the window and inflate replyCount.",
+      "snapshot": {
+        "replies": [
+          5,
+          6,
+          7
+        ],
+        "replyCount": 7
+      },
+      "frames": [
+        {
+          "seq": 5,
+          "replyCount": 7
+        },
+        {
+          "seq": 6,
+          "replyCount": 7
+        },
+        {
+          "seq": 7,
+          "replyCount": 7
+        }
+      ],
+      "expect": {
+        "replies": [
+          5,
+          6,
+          7
+        ],
+        "replyCount": 7,
+        "snapshotSeq": 7,
+        "unchanged": true
+      }
+    },
+    {
+      "name": "replay_then_genuinely_new_reply_still_lands",
+      "why": "The seam must not block real new replies that follow a replay.",
+      "snapshot": {
+        "replies": [
+          5,
+          6,
+          7
+        ],
+        "replyCount": 7
+      },
+      "frames": [
+        {
+          "seq": 6,
+          "replyCount": 7
+        },
+        {
+          "seq": 7,
+          "replyCount": 7
+        },
+        {
+          "seq": 8,
+          "replyCount": 8
+        }
+      ],
+      "expect": {
+        "replies": [
+          6,
+          7,
+          8
+        ],
+        "replyCount": 8,
+        "snapshotSeq": 7,
+        "unchanged": false
+      }
+    },
+    {
+      "name": "duplicate_message_id_dropped_even_with_higher_seq",
+      "why": "Identity dedupe, not seq dedupe: a re-delivered message must not appear twice.",
+      "snapshot": {
+        "replies": [
+          7
+        ],
+        "replyCount": 7
+      },
+      "frames": [
+        {
+          "seq": 8,
+          "replyCount": 7,
+          "messageId": "m-7"
+        }
+      ],
+      "expect": {
+        "replies": [
+          7
+        ],
+        "replyCount": 7,
+        "snapshotSeq": 7,
+        "unchanged": true
+      }
+    },
+    {
+      "name": "reply_below_seam_ignored_even_when_window_has_room",
+      "why": "Guards against 'only apply the seam when the window is full' — an already-counted reply stays out regardless of room.",
+      "snapshot": {
+        "replies": [
+          9
+        ],
+        "replyCount": 9
+      },
+      "frames": [
+        {
+          "seq": 3,
+          "replyCount": 9
+        }
+      ],
+      "expect": {
+        "replies": [
+          9
+        ],
+        "replyCount": 9,
+        "snapshotSeq": 9,
+        "unchanged": true
+      }
+    },
+    {
+      "name": "empty_scope_ingests_first_reply_seam_stays_zero",
+      "why": "No snapshot was ever loaded, so the seam is 0 — and a live frame must never move it.",
+      "snapshot": {
+        "replies": [],
+        "replyCount": 0
+      },
+      "frames": [
+        {
+          "seq": 1,
+          "replyCount": 1
+        }
+      ],
+      "expect": {
+        "replies": [
+          1
+        ],
+        "replyCount": 1,
+        "snapshotSeq": 0,
+        "unchanged": false
+      }
+    },
+    {
+      "name": "evicted_live_reply_replay_is_noop",
+      "why": "@Android-Developer-2's find. Window holds only N: after 6,7,8,9 the reply m-6 is EVICTED. A replayed frame for m-6 is no longer found by a window-scoped identity check, and its seq is above the seam — so a model that derives the count takes the 'new' branch and DOUBLE-COUNTS, and returns a fresh object. Correct: window unchanged, count unchanged, SAME reference.",
+      "snapshot": {
+        "replies": [
+          5
+        ],
+        "replyCount": 5
+      },
+      "frames": [
+        {
+          "seq": 6,
+          "replyCount": 6
+        },
+        {
+          "seq": 7,
+          "replyCount": 7
+        },
+        {
+          "seq": 8,
+          "replyCount": 8
+        },
+        {
+          "seq": 9,
+          "replyCount": 9
+        },
+        {
+          "seq": 6,
+          "replyCount": 9
+        }
+      ],
+      "expect": {
+        "replies": [
+          7,
+          8,
+          9
+        ],
+        "replyCount": 9,
+        "snapshotSeq": 5,
+        "unchanged": false,
+        "lastFrameUnchanged": true
+      }
+    }
+  ]
+}

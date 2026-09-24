@@ -1,0 +1,41 @@
+-- Task #172 — retire `defer`, phase 1 data face.
+--
+-- Drains every remaining `deferred` row so the status has no live producers AND no live rows.
+-- The code half of this phase already stopped producing them: `ServerSetupAction` no longer
+-- accepts "defer" and nothing writes `setup_deferred_at`. This is the other half.
+--
+-- WHY 'complete' AND NOT 'not_started':
+-- `deferred` is the ONLY incomplete status with blocksChat = false. Those owners bypassed setup
+-- and have been using chat ever since. Rewinding them to `not_started` would re-lock servers
+-- that work today — it would create the #4883/#5254 trap rather than clean up after it. So the
+-- row moves FORWARD.
+--
+-- WHY 'grandfathered':
+-- These servers never completed setup through the normal path; the reason column must say that
+-- honestly rather than claim a completion that did not happen. `grandfathered` is the existing
+-- value for "accepted as complete without having run the flow" and is already produced by
+-- reconcileOwnersToSetupCheckpoint.
+--
+-- SCOPE — deliberately the WHOLE TABLE, no server-kind filter:
+-- Reviewed and requested by @Vivian. Scoping to kind='normal' would leave `deferred` rows alive
+-- in other kinds (joint_storage, soft-deleted servers), and the point of this phase is that the
+-- full-table count reaches zero. A status with zero producers but surviving rows is exactly the
+-- state that makes a later CHECK-constraint drop unsafe. Soft-deleted servers are included on
+-- purpose: undeleting one must not resurrect a retired status.
+--
+-- There is deliberately NO second "ever had an agent" bucket. An earlier draft carried one keyed
+-- on EXISTS (SELECT 1 FROM agents …), which disagreed with the runtime's own checkpoint
+-- (everHadAgent = !!servers.onboarding_agent_id) and matched 0 production rows — caught by
+-- @meichen in data-face review. serverService.reconcileOwnersToSetupCheckpoint already holds
+-- that invariant online, on every owner-entry and checkpoint write path.
+--
+-- Existing `complete_after_defer` rows are NOT touched: they are already complete, and their
+-- reason records real history.
+--
+-- Idempotent by construction — the predicate excludes rows this statement has already moved, so
+-- a re-run affects 0 rows. Phase 2 drops `setup_deferred_at` and the enum/CHECK membership of
+-- 'deferred', and may only run once this has drained in every environment.
+UPDATE "server_members"
+SET "setup_status" = 'complete',
+    "setup_completion_reason" = 'grandfathered'
+WHERE "setup_status" = 'deferred';

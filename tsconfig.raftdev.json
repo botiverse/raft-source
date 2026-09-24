@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "allowImportingTsExtensions": true,
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "typeRoots": ["./packages/shared/node_modules/@types"],
+    "types": ["node"]
+  },
+  "include": ["scripts/dev/raftdev*.ts"],
+  "exclude": ["node_modules", "dist"]
+}

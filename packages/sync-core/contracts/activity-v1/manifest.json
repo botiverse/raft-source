@@ -1,0 +1,25 @@
+{
+  "contract": "raft.activity-sync",
+  "version": 1,
+  "status": "experimental",
+  "runnerProtocol": 1,
+  "typespecVersion": "1.14.0",
+  "bindingTopology": {
+    "typescript": "activity-sync.tsp -> TypeSpec semantic graph -> TypeScript",
+    "kotlin": "activity-sync.tsp -> direct Kotlin generator (semantic graph; canary by @HanXin, task #883)",
+    "jsonSchema": "activity-sync.tsp -> JSON Schema (parallel runtime-validation leg)",
+    "openApi": "activity-sync.tsp -> OpenAPI (parallel HTTP-operation leg)"
+  },
+  "sourceSha256": "e47e0d12055c37c01c522f608e5d1b2e56378a588b24894f450468353791bdad",
+  "jsonSchemaTreeSha256": "1a30a85cd621b638d43a5d4cb172d8ff132044f12978a68f65e93cb9608429ed",
+  "openApiSha256": "f4184796541e9cbafc44799655bde3f8a79580dc833da41b11ec4a2295ee18ce",
+  "typescriptBindingSha256": "f057125bea028094bc706a1a23881e2894ea9a5e9435d0666e3a9bbfc5209642",
+  "typescriptLegVerifierSha256": "65981a28e7de98e521e19f9f27eb70ed0c2f15da9db09fbb85d6d5a7ad209d70",
+  "typescriptLegMutationSha256": "95d87be58aeca2e80cea57fa4d790b532ff74291834582dda4b51fb27a9a2bc7",
+  "kotlinBindingSha256": "382390936dc7e2d14b07d0ab673d0ef0bbd25cf4b03547d59382f2592ca49bf2",
+  "contractVectorsSha256": "89ef866cc5e16dd321945c422e5f9ae7919157312d4bafbc68e9241d6ae3bee3",
+  "behaviorVectorsSha256": "ac94f85c23656184724e7b91e4957e278b4a8554878600842c3684b9c7855bd1",
+  "behaviorSeedSha256": "90b2b32ec7bd73575df3977ed7e62dcbf4a833e164d29813f28e65a619b29100",
+  "canonicalBehaviorResultSha256": null,
+  "compatibilityReceipt": null
+}

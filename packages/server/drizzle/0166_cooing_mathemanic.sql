@@ -1,0 +1,2 @@
+ALTER TABLE "feature_flag_rules" DROP CONSTRAINT "feature_flag_rules_stage_valid";--> statement-breakpoint
+ALTER TABLE "feature_flag_rules" ADD CONSTRAINT "feature_flag_rules_stage_valid" CHECK ("feature_flag_rules"."stage" IN ('user', 'platform', 'server', 'plan', 'percentage'));

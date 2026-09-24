@@ -1,0 +1,117 @@
+{
+  "comment": "Intentional React↔Android divergences for visual testing (task #370/#373, artin 2026-07-06). Each entry documents a KNOWN, ACCEPTED difference so triage sweeps do not re-report it as a bug. direction values: 'react-adopts-later' = the android behavior is the desired product feature and React should eventually catch up (do NOT change android; react work is deferred); 'platform-difference' = both sides are correct for their platform, never align. Optional appliesTo key (spec: provider-pair-first PR-3, task #430) scopes an entry to a pair class: 'baselineOnly' (react__<platform> pairs), 'crossPlatform' (mobile↔mobile pairs like android__ios), 'allPairs'. When appliesTo is absent it defaults by direction: react-adopts-later → baselineOnly (it describes distance from the react reference), platform-difference → allPairs. Update this file in the same PR whenever the owner declares a new intentional divergence or retires one.",
+  "divergences": [
+    {
+      "caseId": "components.tasks.panel.states",
+      "area": "task card top-right timestamp",
+      "direction": "react-adopts-later",
+      "note": "Android shows a per-task timestamp at the card's top-right (relative format). React's panel currently shows none — react should adopt it. Declared by artin 2026-07-06 (task #373 thread).",
+      "declaredBy": "artin",
+      "declaredAt": "2026-07-06"
+    },
+    {
+      "caseId": "components.tasks.panel.states",
+      "area": "task card bottom-left assignee line",
+      "direction": "react-adopts-later",
+      "note": "Android shows the assignee (Unassigned/@name) at the card's bottom-left. React should adopt it; do not remove from android.",
+      "declaredBy": "artin",
+      "declaredAt": "2026-07-06"
+    },
+    {
+      "caseId": "components.tasks.panel.states",
+      "area": "filter row presence and wrap layout",
+      "direction": "platform-difference",
+      "note": "The filter chip row (Channel/Creator/Assignee) is an android feature; its single-row layout vs react's wrapped layout is a platform difference and must not be 'fixed'. Chip casing and visual styling DO align to react (Title case, shared chip tokens).",
+      "declaredBy": "artin",
+      "declaredAt": "2026-07-06"
+    },
+    {
+      "caseId": "components.thread.composer.file-previews",
+      "area": "entire case",
+      "direction": "platform-difference",
+      "note": "Deliberately skipped; artin deprioritized this case (task #342 era).",
+      "declaredBy": "artin",
+      "declaredAt": "2026-07-05"
+    },
+    {
+      "caseId": "components.settings.account.page",
+      "area": "log-out copy: 'this browser' vs 'this device'",
+      "direction": "platform-difference",
+      "note": "React says 'Sign out of this browser' (web-appropriate); Android says 'Sign out on this device' (mobile-appropriate) in both the log-out subtitle and the confirm message. Both are correct for their platform — never align. Landed in android via task #381 (PR #147). Everything else in this case aligns.",
+      "declaredBy": "artin",
+      "declaredAt": "2026-07-06"
+    },
+    {
+      "caseId": "components.thread.message-row.long-inline-code",
+      "area": "bare #number task chips in message bodies",
+      "direction": "platform-difference",
+      "note": "Android tags every bare #number as a task chip regardless of whether the ref resolves; react gates task refs on known/loaded entities (MessageItem.tsx known-set checks), so unknown refs like '#520' render as plain text on react but as task chips on android. artin ruled keep android's tag-everything behavior ('就全部 tag 呗，反正点了之后会报错没有的', 2026-07-07, task #416 closed). Mention styling is no longer an accepted divergence: self mentions use yellow chips, known other mentions use bold black underline, and unknown mentions remain plain text on both platforms.",
+      "declaredBy": "artin",
+      "declaredAt": "2026-07-07"
+    },
+    {
+      "caseId": "components.home.search.results",
+      "area": "filter chip row (count, sort chip, wrap)",
+      "direction": "platform-difference",
+      "note": "React shows more filter chips (incl. a sort/Recent chip) wrapped across two rows; android's search filter row is a single non-wrapping row with fewer chips. This is an intentional mobile layout — a platform difference, not a defect (mirrors the tasks.panel filter-row declaration). Chip casing/styling still align.",
+      "declaredBy": "artin",
+      "declaredAt": "2026-07-11"
+    },
+    {
+      "caseId": "components.thread.forward-modal",
+      "area": "forward flow (single modal vs two-step)",
+      "direction": "platform-difference",
+      "note": "Android uses a single combined Forward modal with an inline destination list; react uses a two-step flow (search targets, then a separate preview/compose step). Both are correct for their platform — a mobile UX adaptation, never align.",
+      "declaredBy": "artin",
+      "declaredAt": "2026-07-11"
+    },
+    {
+      "caseId": "components.ui.skeleton.states",
+      "area": "vertical content overflow within the fixed canvas",
+      "direction": "platform-difference",
+      "note": "The skeleton fixture is deliberately matched to react's fixed 150px canvas; the content stack overflowing into the bottom padding mirrors CSS (documented in UiSkeletonVisualContent). The residual is a sub-pixel overflow detail, intentional — not a defect.",
+      "declaredBy": "artin",
+      "declaredAt": "2026-07-11"
+    },
+    {
+      "caseId": "components.settings.account.error-state",
+      "area": "account section header label (Profile vs ACCOUNT)",
+      "direction": "platform-difference",
+      "note": "Android labels the account settings section 'Profile'; react labels it 'ACCOUNT'. A platform naming choice, not a defect. (Localization of the android label is handled under the Account i18n task; the cross-platform label difference itself is intentional.)",
+      "declaredBy": "artin",
+      "declaredAt": "2026-07-11"
+    },
+    {
+      "caseId": "components.navigation.tabbar.states",
+      "area": "navigation.tabbar",
+      "direction": "platform-difference",
+      "note": "Android keeps ALL-CAPS tab labels (deliberate mobile brand style) while web MobileTabBar renders Title Case; the smoke fixture's selected tab also differs from web's route-derived active tab. Not a drift to converge.",
+      "declaredBy": "artin",
+      "declaredAt": "2026-07-14"
+    },
+    {
+      "caseId": "components.home.activity.results",
+      "area": "activity card timestamp placement (right-aligned tag row vs title row)",
+      "direction": "react-adopts-later",
+      "note": "Android puts the relative timestamp on the top (channel-tag) row, right-aligned to the card's right edge; react puts it beside the title, which artin ruled steals width from the real message content (#wg-nightly-visual-fix 2026-07-17, re mobile#1039 and #1171). Android is the desired behavior — react should move its timestamp to the right-aligned tag row. The title and the rows below do not move. Do NOT change android.",
+      "declaredBy": "artin",
+      "declaredAt": "2026-07-17"
+    },
+    {
+      "caseId": "screens.auth.login.signing",
+      "area": "GitHub social button color (black vs white)",
+      "direction": "react-adopts-later",
+      "note": "Android renders Continue with GitHub as a black button; react's SocialProviderButton is bg-white for every provider. artin ruled the android black button is correct ('github 按钮不需要换，我觉得我们的对的', #wg-nightly-visual-fix 2026-07-17, re mobile#962). Do NOT change android; whether react adopts black is a web-lane decision.",
+      "declaredBy": "artin",
+      "declaredAt": "2026-07-17"
+    },
+    {
+      "caseId": "components.thread.message-row.md-link-ref",
+      "area": "channel/mention refs inside Markdown link labels",
+      "direction": "platform-difference",
+      "note": "Web renders channel/mention refs inside a Markdown link label as chips (splitting the link visually); Android's Raft dialect keeps the whole label inside one external link. artin ruled 2026-07-25 (#proj-visual-testing:58e605e1) that Web stays as-is — do not re-report this case's label-chip delta as a bug. Task refs in labels already match (both keep the link).",
+      "declaredBy": "artin",
+      "declaredAt": "2026-07-25"
+    }
+  ]
+}

@@ -1,0 +1,1 @@
+ALTER TABLE "agent_knowledge_events" ADD COLUMN "resolution" text;

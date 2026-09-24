@@ -1,0 +1,53 @@
+{
+  "name": "@botiverse/raft-sdk",
+  "version": "0.1.1",
+  "license": "FSL-1.1-ALv2",
+  "description": "Typed Raft Agent API client for external agents and bots.",
+  "type": "module",
+  "main": "./dist/cjs/index.cjs",
+  "module": "./dist/esm/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/esm/index.js",
+      "require": "./dist/cjs/index.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "sideEffects": false,
+  "dependencies": {
+    "zod": "^4.3.6"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/botiverse/raft-source.git",
+    "directory": "packages/raft-sdk"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "rslib build",
+    "test": "node --import tsx --test 'src/**/*.test.ts'",
+    "test:artifact": "pnpm run build && node scripts/check-packed-artifact.mjs",
+    "prepack": "pnpm run build",
+    "prepublishOnly": "pnpm run test && pnpm run test:artifact",
+    "lint:publish-package": "node scripts/check-publish-package.mjs && node scripts/check-publish-workflow.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@microsoft/api-extractor": "7.52.11",
+    "@rslib/core": "0.23.2",
+    "@botiverse/raft-shared": "workspace:*",
+    "@types/node": "^25.5.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}

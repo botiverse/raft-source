@@ -1,0 +1,527 @@
+{
+  "version": 5,
+  "producerRegistryAnchor": "slock#4593@b0fcdfd9fae9f0af9b32a87a1d5c3e196d3fdaa1",
+  "fields": [
+    {
+      "name": "channelId",
+      "class": "canonicalRequired",
+      "wireType": "string",
+      "nullable": false,
+      "mergePolicy": "overwrite",
+      "presence": {
+        "messageNew": "present",
+        "enrichedUpdated": "present",
+        "taskStatusUpdated": "present"
+      }
+    },
+    {
+      "name": "content",
+      "class": "canonicalRequired",
+      "wireType": "string",
+      "nullable": false,
+      "mergePolicy": "overwrite",
+      "presence": {
+        "messageNew": "present",
+        "enrichedUpdated": "present",
+        "taskStatusUpdated": "present"
+      }
+    },
+    {
+      "name": "createdAt",
+      "class": "canonicalRequired",
+      "wireType": "string",
+      "nullable": false,
+      "mergePolicy": "overwrite",
+      "presence": {
+        "messageNew": "present",
+        "enrichedUpdated": "present",
+        "taskStatusUpdated": "present"
+      }
+    },
+    {
+      "name": "id",
+      "class": "canonicalRequired",
+      "wireType": "string",
+      "nullable": false,
+      "mergePolicy": "overwrite",
+      "presence": {
+        "messageNew": "present",
+        "enrichedUpdated": "present",
+        "taskStatusUpdated": "present"
+      }
+    },
+    {
+      "name": "messageType",
+      "class": "canonicalRequired",
+      "wireType": "string-union-raw",
+      "nullable": false,
+      "mergePolicy": "overwrite",
+      "presence": {
+        "messageNew": "present",
+        "enrichedUpdated": "present",
+        "taskStatusUpdated": "present"
+      }
+    },
+    {
+      "name": "randomId",
+      "class": "canonicalRequired",
+      "wireType": "string",
+      "nullable": true,
+      "mergePolicy": "overwrite",
+      "presence": {
+        "messageNew": "present",
+        "enrichedUpdated": "present",
+        "taskStatusUpdated": "present"
+      }
+    },
+    {
+      "name": "senderId",
+      "class": "canonicalRequired",
+      "wireType": "string",
+      "nullable": false,
+      "mergePolicy": "overwrite",
+      "presence": {
+        "messageNew": "present",
+        "enrichedUpdated": "present",
+        "taskStatusUpdated": "present"
+      }
+    },
+    {
+      "name": "senderType",
+      "class": "canonicalRequired",
+      "wireType": "string-union-raw",
+      "nullable": false,
+      "mergePolicy": "overwrite",
+      "presence": {
+        "messageNew": "present",
+        "enrichedUpdated": "present",
+        "taskStatusUpdated": "present"
+      }
+    },
+    {
+      "name": "seq",
+      "class": "canonicalRequired",
+      "wireType": "number",
+      "nullable": false,
+      "mergePolicy": "overwrite",
+      "presence": {
+        "messageNew": "present",
+        "enrichedUpdated": "present",
+        "taskStatusUpdated": "present"
+      }
+    },
+    {
+      "name": "threadId",
+      "class": "canonicalRequired",
+      "wireType": "string",
+      "nullable": true,
+      "mergePolicy": "overwrite",
+      "presence": {
+        "messageNew": "present",
+        "enrichedUpdated": "present",
+        "taskStatusUpdated": "present"
+      }
+    },
+    {
+      "name": "actionMetadata",
+      "class": "optionalAggregate",
+      "wireType": "structured-json",
+      "nullable": true,
+      "mergePolicy": "present-overwrite",
+      "presence": {
+        "messageNew": "present",
+        "enrichedUpdated": "present",
+        "taskStatusUpdated": "present"
+      }
+    },
+    {
+      "name": "attachments",
+      "class": "optionalAggregate",
+      "wireType": "array<attachment>",
+      "nullable": false,
+      "mergePolicy": "present-overwrite",
+      "presence": {
+        "messageNew": "present",
+        "enrichedUpdated": "present",
+        "taskStatusUpdated": "absent"
+      }
+    },
+    {
+      "name": "commentRef",
+      "class": "optionalAggregate",
+      "wireType": "object<commentRef>",
+      "nullable": true,
+      "mergePolicy": "shared-null-preserve",
+      "presence": {
+        "messageNew": "present",
+        "enrichedUpdated": "present",
+        "taskStatusUpdated": "absent"
+      }
+    },
+    {
+      "name": "conversationContext",
+      "class": "optionalAggregate",
+      "wireType": "object<conversationContext>",
+      "nullable": false,
+      "mergePolicy": "present-overwrite",
+      "presence": {
+        "messageNew": "present",
+        "enrichedUpdated": "absent",
+        "taskStatusUpdated": "absent"
+      }
+    },
+    {
+      "name": "externalAuthor",
+      "class": "optionalAggregate",
+      "wireType": "object<externalAuthor>",
+      "nullable": true,
+      "mergePolicy": "present-overwrite",
+      "presence": {
+        "messageNew": "present",
+        "enrichedUpdated": "present",
+        "taskStatusUpdated": "absent"
+      }
+    },
+    {
+      "name": "mentions",
+      "class": "optionalAggregate",
+      "wireType": "array<mention>",
+      "nullable": false,
+      "mergePolicy": "present-overwrite",
+      "presence": {
+        "messageNew": "present",
+        "enrichedUpdated": "present",
+        "taskStatusUpdated": "absent"
+      }
+    },
+    {
+      "name": "reactions",
+      "class": "optionalAggregate",
+      "wireType": "array<reaction>",
+      "nullable": false,
+      "mergePolicy": "present-overwrite",
+      "presence": {
+        "messageNew": "present",
+        "enrichedUpdated": "present",
+        "taskStatusUpdated": "absent"
+      }
+    },
+    {
+      "name": "senderDescription",
+      "class": "optionalAggregate",
+      "wireType": "string",
+      "nullable": true,
+      "mergePolicy": "present-overwrite",
+      "presence": {
+        "messageNew": "present",
+        "enrichedUpdated": "present",
+        "taskStatusUpdated": "absent"
+      }
+    },
+    {
+      "name": "senderMembershipStatus",
+      "class": "optionalAggregate",
+      "wireType": "string-union-raw",
+      "nullable": true,
+      "mergePolicy": "present-overwrite",
+      "presence": {
+        "messageNew": "present",
+        "enrichedUpdated": "present",
+        "taskStatusUpdated": "absent"
+      }
+    },
+    {
+      "name": "senderName",
+      "class": "optionalAggregate",
+      "wireType": "string",
+      "nullable": false,
+      "mergePolicy": "present-overwrite",
+      "presence": {
+        "messageNew": "present",
+        "enrichedUpdated": "present",
+        "taskStatusUpdated": "present"
+      }
+    }
+  ],
+  "nestedWireShapes": {
+    "attachment": [
+      {
+        "name": "filename",
+        "wireType": "string",
+        "nullable": false
+      },
+      {
+        "name": "height",
+        "wireType": "number",
+        "nullable": true
+      },
+      {
+        "name": "id",
+        "wireType": "string",
+        "nullable": false
+      },
+      {
+        "name": "mimeType",
+        "wireType": "string",
+        "nullable": false
+      },
+      {
+        "name": "sizeBytes",
+        "wireType": "number",
+        "nullable": false
+      },
+      {
+        "name": "thumbnailUrl",
+        "wireType": "string",
+        "nullable": true
+      },
+      {
+        "name": "width",
+        "wireType": "number",
+        "nullable": true
+      }
+    ],
+    "reaction": [
+      {
+        "name": "count",
+        "wireType": "number",
+        "nullable": false
+      },
+      {
+        "name": "emoji",
+        "wireType": "string",
+        "nullable": false
+      },
+      {
+        "name": "reactorIds",
+        "wireType": "array<string>",
+        "nullable": false
+      },
+      {
+        "name": "reactorNames",
+        "wireType": "array<string>",
+        "nullable": false
+      }
+    ],
+    "mention": [
+      {
+        "name": "id",
+        "wireType": "string",
+        "nullable": false
+      },
+      {
+        "name": "name",
+        "wireType": "string",
+        "nullable": false
+      },
+      {
+        "name": "type",
+        "wireType": "string-union-raw",
+        "nullable": false
+      }
+    ],
+    "commentRef": [
+      {
+        "name": "anchorLabel",
+        "wireType": "string",
+        "nullable": true
+      },
+      {
+        "name": "anchorQuote",
+        "wireType": "string",
+        "nullable": true
+      },
+      {
+        "name": "attachmentId",
+        "wireType": "string",
+        "nullable": false
+      },
+      {
+        "name": "filename",
+        "wireType": "string",
+        "nullable": false
+      },
+      {
+        "name": "hostMessageId",
+        "wireType": "string",
+        "nullable": true
+      },
+      {
+        "name": "hostSource",
+        "wireType": "object<hostSource>",
+        "nullable": true
+      }
+    ],
+    "commentRefHostSource": [
+      {
+        "name": "channelId",
+        "wireType": "string",
+        "nullable": false
+      },
+      {
+        "name": "parentMessageId",
+        "wireType": "string",
+        "nullable": false,
+        "optionalKey": true
+      },
+      {
+        "name": "rootThreadChannelId",
+        "wireType": "string",
+        "nullable": false,
+        "optionalKey": true
+      },
+      {
+        "name": "routeKind",
+        "wireType": "string-union-raw",
+        "nullable": false
+      },
+      {
+        "name": "threadChannelId",
+        "wireType": "string",
+        "nullable": false,
+        "optionalKey": true
+      },
+      {
+        "name": "type",
+        "wireType": "string-union-raw",
+        "nullable": false
+      }
+    ],
+    "conversationContext": [
+      {
+        "name": "channelType",
+        "wireType": "string-union-raw",
+        "nullable": false
+      },
+      {
+        "name": "parentChannelId",
+        "wireType": "string",
+        "nullable": false,
+        "optionalKey": true
+      },
+      {
+        "name": "parentChannelType",
+        "wireType": "string-union-raw",
+        "nullable": false,
+        "optionalKey": true
+      },
+      {
+        "name": "parentMessageId",
+        "wireType": "string",
+        "nullable": false,
+        "optionalKey": true
+      }
+    ],
+    "externalAuthor": [
+      {
+        "name": "actorKind",
+        "wireType": "string-union-raw",
+        "nullable": false
+      },
+      {
+        "name": "actorProjectionRevision",
+        "wireType": "number",
+        "nullable": false
+      },
+      {
+        "name": "appRegistrationId",
+        "wireType": "string",
+        "nullable": false
+      },
+      {
+        "name": "avatarDigest",
+        "wireType": "string",
+        "nullable": true
+      },
+      {
+        "name": "avatarUrl",
+        "wireType": "string",
+        "nullable": true
+      },
+      {
+        "name": "displayName",
+        "wireType": "string",
+        "nullable": false
+      },
+      {
+        "name": "externalActorId",
+        "wireType": "string",
+        "nullable": false
+      },
+      {
+        "name": "externalConversationId",
+        "wireType": "string",
+        "nullable": false
+      },
+      {
+        "name": "externalMessageId",
+        "wireType": "string",
+        "nullable": false
+      },
+      {
+        "name": "installId",
+        "wireType": "string",
+        "nullable": false
+      },
+      {
+        "name": "projectionId",
+        "wireType": "string",
+        "nullable": false
+      },
+      {
+        "name": "provider",
+        "wireType": "string",
+        "nullable": false
+      },
+      {
+        "name": "workspaceId",
+        "wireType": "string",
+        "nullable": false
+      }
+    ]
+  },
+  "exclusions": {
+    "taskDomainProjection": {
+      "fields": [
+        "taskAssigneeId",
+        "taskAssigneeName",
+        "taskAssigneeType",
+        "taskClaimedAt",
+        "taskCompletedAt",
+        "taskCurrentProjection",
+        "taskNumber",
+        "taskStatus"
+      ],
+      "migrationStatus": "active-consumers (web taskStore / KMP task projection); dual-dispatch at ingress"
+    },
+    "emittedUnconsumed": {
+      "fields": [
+        "updatedAt"
+      ],
+      "migrationStatus": "web canonical zero-consumption; mobile legacy consumption to retire in round-2 (label/event-key/SQL cache -> (epoch,seq,id/revision) adjudication)"
+    },
+    "viewerScopedFields": {
+      "fields": [
+        "attachment.commentCount"
+      ],
+      "migrationStatus": "overlay-domain data; never apply shared-stripped values to canonical or overlay state"
+    },
+    "clientOnly": {
+      "fields": [
+        "optimisticDisplaySeq"
+      ],
+      "migrationStatus": "n/a (never on wire)"
+    },
+    "storageOnlySealed": {
+      "fields": [
+        "agentSendKey",
+        "searchText",
+        "searchVector"
+      ],
+      "migrationStatus": "sealed server-side; G6 registry gate enforces post-projection shape"
+    }
+  },
+  "excludedClientOnly": [
+    "optimisticDisplaySeq"
+  ]
+}

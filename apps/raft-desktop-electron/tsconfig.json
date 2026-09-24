@@ -1,0 +1,23 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2023", "DOM"],
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    // We now import @botiverse/raft-computer, which pulls in source-only
+    // workspace packages (raft-shared) and node_modules that ship .ts (k-carrier).
+    // These flags match apps/raft-computer-app so those transitive sources
+    // typecheck; our own strictness (strict:true) still applies to src/.
+    "allowImportingTsExtensions": true,
+    "isolatedModules": true,
+    "resolveJsonModule": true,
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts", "tsup.config.ts"],
+  "exclude": ["dist", "node_modules"]
+}

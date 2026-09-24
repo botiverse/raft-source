@@ -1,0 +1,1 @@
+ALTER TABLE "oauth_clients" ADD COLUMN "agent_manifest_url" text;

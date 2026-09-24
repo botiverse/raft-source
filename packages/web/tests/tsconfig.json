@@ -1,0 +1,5 @@
+{
+  "//": "Config for tsx when running tests under tests/. Inherits the app's compilerOptions (notably jsx: react-jsx). include covers tests/ AND ../src so tsx applies automatic JSX to imported src components too (not just in-test components). Tests are NOT part of the app's `tsc --noEmit` typecheck (separate config).",
+  "extends": "../tsconfig.json",
+  "include": ["**/*.ts", "**/*.tsx", "../src/**/*.ts", "../src/**/*.tsx"]
+}

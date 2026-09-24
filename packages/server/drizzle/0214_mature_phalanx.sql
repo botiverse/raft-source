@@ -1,0 +1,1 @@
+CREATE INDEX "read_mutations_worker_pending_idx" ON "read_mutations" USING btree ("server_id","principal_type","principal_id","authority_seq","state","lease_expires_at") WHERE "read_mutations"."state" IN ('admitted', 'executing');

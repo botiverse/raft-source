@@ -1,0 +1,35 @@
+node_modules/
+dist/
+dist-electron/
+shim-dist/
+*.log
+.claude/*
+!.claude/skills/
+*.db
+release/
+.env
+.env.scopedb
+.dev-env-*.json
+.slockdev/
+# Local uploads when the server or tests run from the repository root.
+/uploads/
+**/.wrangler/
+**/.flow/
+artifacts/perf/
+packages/web/.playwright/
+packages/cli/test-results/
+packages/web/test-results/
+packages/visual-testing/test-results/
+# Local `slock-visual` / visual-testing playwright runs write these at the repo root.
+artifacts/visual-testing/
+visual-testing-results/
+packages/server/.playwright/
+packages/web/tests/stress/artifacts/
+packages/web/.render-perf/
+
+scripts/app-name-ratchet-baseline.txt.mutating
+
+
+# Written by scripts/source-available/export-snapshot.mjs into exported snapshots only;
+# tests skip private-layout contracts when it exists.
+/RELEASE_SOURCE

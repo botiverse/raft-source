@@ -1,0 +1,1 @@
+ALTER TABLE "servers" ADD COLUMN "avatar_url" text;

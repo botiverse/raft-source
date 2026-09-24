@@ -1,0 +1,2 @@
+ALTER TABLE "server_members" ADD COLUMN "sidebar_channel_sort_mode" text DEFAULT 'manual' NOT NULL;--> statement-breakpoint
+ALTER TABLE "server_members" ADD COLUMN "sidebar_dm_sort_mode" text DEFAULT 'manual' NOT NULL;

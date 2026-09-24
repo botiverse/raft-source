@@ -1,0 +1,1 @@
+ALTER TABLE "messages" ADD COLUMN "message_type" text DEFAULT 'chat' NOT NULL;

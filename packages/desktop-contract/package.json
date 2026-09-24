@@ -1,0 +1,27 @@
+{
+  "name": "@raft/desktop-contract",
+  "version": "0.1.0",
+  "license": "FSL-1.1-ALv2",
+  "private": true,
+  "type": "module",
+  "description": "Shared typed contract for Raft Desktop — IPC schemas, manifest types, capability IDs, URI grammar",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./capabilities": "./src/capabilities.ts",
+    "./ipc": "./src/ipc.ts",
+    "./manifest": "./src/manifest.ts",
+    "./uri": "./src/uri.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "ajv": "^8.20.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
+  }
+}

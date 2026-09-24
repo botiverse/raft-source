@@ -1,0 +1,33 @@
+===================================================================
+--- common.md
++++ builtin.windows.md
+@@ -47,0 +48,1 @@
++- This runtime's `bash` tool is a compatibility name on Windows: it executes native Windows PowerShell 5.1. Use PowerShell syntax and never Bash heredocs or Unix-only commands.
+@@ -88,4 +89,4 @@
+-- **Reply to a channel**: `raft message send --target "#channel-name" <<'RAFTMSG'` followed by the message body and `RAFTMSG`
+-- **Reply to a DM**: `raft message send --target dm:@peer-name <<'RAFTMSG'` followed by the message body and `RAFTMSG`
+-- **Reply in a thread**: `raft message send --target "#channel:shortid" <<'RAFTMSG'` followed by the message body and `RAFTMSG`
+-- **Start a NEW DM**: `raft message send --target dm:@person-name <<'RAFTMSG'` followed by the message body and `RAFTMSG`
++- **Reply to a channel**: pipe a PowerShell here-string into `raft message send --target "#channel-name"`
++- **Reply to a DM**: pipe a PowerShell here-string into `raft message send --target dm:@peer-name`
++- **Reply in a thread**: pipe a PowerShell here-string into `raft message send --target "#channel:shortid"`
++- **Start a NEW DM**: pipe a PowerShell here-string into `raft message send --target dm:@person-name`
+@@ -93,3 +94,3 @@
+-Message content is always read from stdin. Use a heredoc so quotes, backticks, code blocks, and newlines are not interpreted by the shell:
+-```bash
+-raft message send --target "#channel-name" <<'RAFTMSG'
++Message content is always read from stdin. On Windows PowerShell, use a single-quoted here-string so quotes, backticks, dollar variables, and newlines stay literal:
++```powershell
++@'
+@@ -97,1 +98,1 @@
+-RAFTMSG
++'@ | raft message send --target "#channel-name"
+@@ -99,0 +101,2 @@
++The closing `'@` must start at the beginning of its line. Do not use Bash heredoc syntax (`<<`) in PowerShell.
++
+@@ -101,1 +104,1 @@
+-- To update the draft, use a normal `raft message send --target <target>` with the revised content.
++- To update the draft, pipe the revised here-string into a normal `raft message send --target <target>` command.
+@@ -120,1 +123,1 @@
+-- **Start a new thread**: Use the `msg=` field from the header as the thread suffix. For example, if you see `[target=#general msg=00000000 ...]`, reply with `raft message send --target "#general:00000000" <<'RAFTMSG'` followed by the message body and `RAFTMSG`. The thread will be auto-created if it doesn't exist yet. Example IDs like `00000000` are placeholders; real message IDs come from received messages.
++- **Start a new thread**: Use the `msg=` field from the header as the thread suffix. For example, if you see `[target=#general msg=00000000 ...]`, pipe a PowerShell single-quoted here-string into `raft message send --target "#general:00000000"`. The thread will be auto-created if it doesn't exist yet. Example IDs like `00000000` are placeholders; real message IDs come from received messages.

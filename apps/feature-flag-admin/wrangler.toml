@@ -1,0 +1,69 @@
+name = "slock-feature-flag-admin"
+main = "src/worker.ts"
+compatibility_date = "2026-06-01"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = false
+
+[assets]
+directory = "./dist/client"
+binding = "ASSETS"
+run_worker_first = true
+not_found_handling = "single-page-application"
+
+[vars]
+RAFT_ORIGIN = "https://app.raft.build"
+RAFT_API_ORIGIN = "https://api.raft.build"
+RAFT_CLIENT_ID = "slock-feature-flag-admin"
+FEATURE_FLAG_ALLOWED_SERVER_IDS = "95f993fa-2a68-4797-b8ae-7beb7d984ada"
+# Admin and Announcement publisher roles are enabled rows in the Worker-owned
+# D1 feature_flag_admin_role_grants table. There is no source/env bootstrap
+# bypass. Agent publishers fail closed even when a grant row exists.
+
+# Runtime-required secrets and environment-specific vars, configured outside source control:
+# - RAFT_CLIENT_SECRET
+# - FEATURE_FLAG_SESSION_SECRET
+
+# All admin operations require the Hyperdrive binding and D1 audit/permission
+# database. There is no Raft-core admin proxy fallback.
+#
+[[hyperdrive]]
+binding = "FEATURE_FLAG_PG"
+id = "4d73351671b9464a8cbc37e978002169"
+
+[[d1_databases]]
+binding = "FEATURE_FLAG_AUDIT_DB"
+database_name = "slock-feature-flag-admin-audit"
+database_id = "db117923-c16f-4893-b49e-d3bfbb56fac9"
+
+# Staging is rendered into wrangler.staging.generated.toml immediately before
+# validation/deploy. These intentionally invalid placeholder ids make an
+# unrendered configuration fail closed.
+[env.staging]
+name = "slock-feature-flag-admin-staging"
+workers_dev = true
+preview_urls = false
+
+[env.staging.observability]
+enabled = true
+head_sampling_rate = 1
+
+[env.staging.observability.logs]
+enabled = true
+head_sampling_rate = 1
+invocation_logs = true
+persist = true
+
+[env.staging.vars]
+RAFT_ORIGIN = "https://app.raft.build"
+RAFT_API_ORIGIN = "https://api.raft.build"
+RAFT_CLIENT_ID = "slock-feature-flag-admin-staging"
+FEATURE_FLAG_ALLOWED_SERVER_IDS = "__FEATURE_FLAG_ADMIN_STAGING_ALLOWED_SERVER_IDS__"
+
+[[env.staging.hyperdrive]]
+binding = "FEATURE_FLAG_PG"
+id = "__FEATURE_FLAG_ADMIN_STAGING_HYPERDRIVE_ID__"
+
+[[env.staging.d1_databases]]
+binding = "FEATURE_FLAG_AUDIT_DB"
+database_name = "slock-feature-flag-admin-audit-staging"
+database_id = "__FEATURE_FLAG_ADMIN_STAGING_AUDIT_DATABASE_ID__"

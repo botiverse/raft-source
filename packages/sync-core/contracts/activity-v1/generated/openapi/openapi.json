@@ -1,0 +1,2924 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Raft Activity Sync Contract v1 (experimental successor)",
+    "version": "0.0.0"
+  },
+  "tags": [],
+  "paths": {
+    "/api/channels/activity/difference": {
+      "get": {
+        "operationId": "getActivityDifference",
+        "parameters": [
+          {
+            "name": "requestId",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OpaqueId"
+            },
+            "explode": false
+          },
+          {
+            "name": "epoch",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/UInt64String"
+            },
+            "explode": false
+          },
+          {
+            "name": "afterWatermark",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/UInt64String"
+            },
+            "explode": false
+          },
+          {
+            "name": "filter",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ActivityFilter"
+            },
+            "explode": false
+          },
+          {
+            "name": "windowId",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "main"
+              ]
+            },
+            "explode": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The request has succeeded.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/DifferenceIngress"
+                    },
+                    {
+                      "$ref": "#/components/schemas/NotModifiedIngress"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The server could not understand the request due to invalid syntax.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Access is unauthorized.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1AuthErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Access is forbidden.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The request conflicts with the current state of the server.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SnapshotRequiredBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/channels/activity/snapshot": {
+      "get": {
+        "operationId": "getActivitySnapshot",
+        "parameters": [
+          {
+            "name": "requestId",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OpaqueId"
+            },
+            "explode": false
+          },
+          {
+            "name": "filter",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ActivityFilter"
+            },
+            "explode": false
+          },
+          {
+            "name": "windowId",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "main"
+              ]
+            },
+            "explode": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The request has succeeded.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SnapshotIngress"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The server could not understand the request due to invalid syntax.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Access is unauthorized.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1AuthErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Access is forbidden.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/channels/inbox": {
+      "get": {
+        "operationId": "getInbox",
+        "parameters": [
+          {
+            "name": "filter",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ActivityFilter"
+            },
+            "explode": false
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            },
+            "explode": false
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            },
+            "explode": false
+          },
+          {
+            "name": "channelId",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/OpaqueId"
+            },
+            "explode": false
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            },
+            "explode": false
+          },
+          {
+            "name": "sort",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "asc",
+                "desc"
+              ]
+            },
+            "explode": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The request has succeeded.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1InboxPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The server could not understand the request due to invalid syntax.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Access is unauthorized.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1AuthErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Access is forbidden.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/channels/inbox/done": {
+      "post": {
+        "operationId": "markInboxDone",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "The request has succeeded.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1AckResponse"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "The request has been accepted for processing, but processing has not yet completed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1AdmittedResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The server could not understand the request due to invalid syntax.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1DoneBadRequestBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Access is unauthorized.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1AuthErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Access is forbidden.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The server cannot find the requested resource.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A bounded Done frontier is beyond the target or its active cursor authority.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1DoneConflictBody"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "A pre-upgrade request has no sequence-space identity and must refresh.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1DoneConflictBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/V1MarkInboxDoneRequest"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/channels/inbox/read-all": {
+      "post": {
+        "operationId": "markInboxReadAll",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "The request has succeeded.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1MarkInboxReadAllResponse"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "The request has been accepted for processing, but processing has not yet completed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1AdmittedResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The server could not understand the request due to invalid syntax.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Access is unauthorized.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1AuthErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Access is forbidden.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/channels/threads/done": {
+      "post": {
+        "operationId": "markThreadDone",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "The request has succeeded.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1AckResponse"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "The request has been accepted for processing, but processing has not yet completed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1AdmittedResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The server could not understand the request due to invalid syntax.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1DoneBadRequestBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Access is unauthorized.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1AuthErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Access is forbidden.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The server cannot find the requested resource.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A bounded Done frontier is beyond the target or its active cursor authority.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1DoneConflictBody"
+                }
+              }
+            }
+          },
+          "412": {
+            "description": "A pre-upgrade request has no sequence-space identity and must refresh.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1DoneConflictBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/V1MarkThreadDoneRequest"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/channels/{channelId}/read-all": {
+      "post": {
+        "operationId": "markChannelReadAll",
+        "parameters": [
+          {
+            "name": "channelId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/OpaqueId"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The request has succeeded.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1MarkChannelReadAllResponse"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "The request has been accepted for processing, but processing has not yet completed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1AdmittedResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The server could not understand the request due to invalid syntax.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Access is unauthorized.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1AuthErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Access is forbidden.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The server cannot find the requested resource.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/V1ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ActivityCommandReceipt": {
+        "type": "object",
+        "required": [
+          "commandId",
+          "applied",
+          "activityVersion",
+          "affectedScopes",
+          "tombstones"
+        ],
+        "properties": {
+          "commandId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "applied": {
+            "type": "boolean"
+          },
+          "activityVersion": {
+            "$ref": "#/components/schemas/UInt64String"
+          },
+          "affectedScopes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AffectedReadState"
+            }
+          },
+          "tombstones": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ActivityRowTombstone"
+            }
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        },
+        "description": "FUTURE (V2) — not returned by any V1 route.\n\nKept as frozen vocabulary so the V2 command protocol has a stable shape, and\nso the ingress union can carry a receipt once the server emits one. Attaching\nit to a V1 200 response is what made the contract lie; do not re-attach it\nwithout a route that actually returns it."
+      },
+      "ActivityFilter": {
+        "type": "string",
+        "enum": [
+          "all",
+          "unread",
+          "mentions"
+        ]
+      },
+      "ActivityFixtureEnvelope": {
+        "type": "object",
+        "required": [
+          "contract",
+          "contractVersion",
+          "runnerProtocol",
+          "status",
+          "caseId",
+          "description",
+          "initialState",
+          "steps"
+        ],
+        "properties": {
+          "contract": {
+            "type": "string",
+            "enum": [
+              "raft.activity-sync"
+            ]
+          },
+          "contractVersion": {
+            "type": "number",
+            "enum": [
+              1
+            ]
+          },
+          "runnerProtocol": {
+            "type": "number",
+            "enum": [
+              1
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "experimental"
+            ]
+          },
+          "caseId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "description": {
+            "type": "string"
+          },
+          "initialState": {
+            "$ref": "#/components/schemas/FixtureInitialState"
+          },
+          "steps": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ActivityFixtureStep"
+            }
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "ActivityFixtureStep": {
+        "type": "object",
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/IngestFixtureStep"
+          },
+          {
+            "$ref": "#/components/schemas/DispatchFixtureStep"
+          },
+          {
+            "$ref": "#/components/schemas/CheckpointFixtureStep"
+          },
+          {
+            "$ref": "#/components/schemas/RestartFixtureStep"
+          }
+        ],
+        "discriminator": {
+          "propertyName": "type",
+          "mapping": {
+            "ingest": "#/components/schemas/IngestFixtureStep",
+            "dispatch": "#/components/schemas/DispatchFixtureStep",
+            "checkpoint": "#/components/schemas/CheckpointFixtureStep",
+            "restart": "#/components/schemas/RestartFixtureStep"
+          }
+        }
+      },
+      "ActivityIngress": {
+        "type": "object",
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/SnapshotIngress"
+          },
+          {
+            "$ref": "#/components/schemas/NotModifiedIngress"
+          },
+          {
+            "$ref": "#/components/schemas/DifferenceIngress"
+          },
+          {
+            "$ref": "#/components/schemas/FrameIngress"
+          },
+          {
+            "$ref": "#/components/schemas/CommandReceiptIngress"
+          },
+          {
+            "$ref": "#/components/schemas/CommandRejectedIngress"
+          },
+          {
+            "$ref": "#/components/schemas/ReadStateUpdatedIngress"
+          }
+        ],
+        "discriminator": {
+          "propertyName": "type",
+          "mapping": {
+            "snapshot": "#/components/schemas/SnapshotIngress",
+            "notModified": "#/components/schemas/NotModifiedIngress",
+            "difference": "#/components/schemas/DifferenceIngress",
+            "frame": "#/components/schemas/FrameIngress",
+            "commandReceipt": "#/components/schemas/CommandReceiptIngress",
+            "commandRejected": "#/components/schemas/CommandRejectedIngress",
+            "readStateUpdated": "#/components/schemas/ReadStateUpdatedIngress"
+          }
+        }
+      },
+      "ActivityIntent": {
+        "type": "object",
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/EnsureWindowIntent"
+          },
+          {
+            "$ref": "#/components/schemas/RefreshIntent"
+          },
+          {
+            "$ref": "#/components/schemas/LoadMoreIntent"
+          },
+          {
+            "$ref": "#/components/schemas/MarkChannelReadAllIntent"
+          },
+          {
+            "$ref": "#/components/schemas/MarkInboxReadAllIntent"
+          },
+          {
+            "$ref": "#/components/schemas/MarkThreadDoneIntent"
+          },
+          {
+            "$ref": "#/components/schemas/MarkInboxDoneIntent"
+          }
+        ],
+        "discriminator": {
+          "propertyName": "type",
+          "mapping": {
+            "ensureWindow": "#/components/schemas/EnsureWindowIntent",
+            "refresh": "#/components/schemas/RefreshIntent",
+            "loadMore": "#/components/schemas/LoadMoreIntent",
+            "markChannelReadAll": "#/components/schemas/MarkChannelReadAllIntent",
+            "markInboxReadAll": "#/components/schemas/MarkInboxReadAllIntent",
+            "markThreadDone": "#/components/schemas/MarkThreadDoneIntent",
+            "markInboxDone": "#/components/schemas/MarkInboxDoneIntent"
+          }
+        }
+      },
+      "ActivityRow": {
+        "type": "object",
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/ChannelActivityRow"
+          },
+          {
+            "$ref": "#/components/schemas/DmActivityRow"
+          },
+          {
+            "$ref": "#/components/schemas/ThreadActivityRow"
+          }
+        ],
+        "discriminator": {
+          "propertyName": "type",
+          "mapping": {
+            "channel": "#/components/schemas/ChannelActivityRow",
+            "dm": "#/components/schemas/DmActivityRow",
+            "thread": "#/components/schemas/ThreadActivityRow"
+          }
+        }
+      },
+      "ActivityRowCommon": {
+        "type": "object",
+        "required": [
+          "rowId",
+          "rowVersion",
+          "latestActivitySeq",
+          "lastActivityAt",
+          "unreadCount",
+          "hasMention",
+          "firstUnreadMessageId",
+          "firstMentionMessageId",
+          "maxReadSeq",
+          "readStateVersion"
+        ],
+        "properties": {
+          "rowId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "rowVersion": {
+            "$ref": "#/components/schemas/UInt64String"
+          },
+          "latestActivitySeq": {
+            "$ref": "#/components/schemas/UInt64String",
+            "description": "Authoritative content-frontier message seq (DB bigint canonical decimal string).\nThe Done/read/reactivation marker authority — replyCount is display-only and must\nnever veto it (task #361 three-axis contract). Required non-null: every row kind\ncarries it same-source (thread = latest reply seq, zero-reply = parent seq; channel/dm\n= last message seq; mention = mention seq). Canonical decimal string, no leading zeros,\nsafe up to 2^53."
+          },
+          "lastActivityAt": {
+            "$ref": "#/components/schemas/UtcInstantString"
+          },
+          "unreadCount": {
+            "type": "integer",
+            "format": "uint32"
+          },
+          "hasMention": {
+            "type": "boolean"
+          },
+          "firstUnreadMessageId": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OpaqueId"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "firstMentionMessageId": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OpaqueId"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "maxReadSeq": {
+            "$ref": "#/components/schemas/UInt64String"
+          },
+          "readStateVersion": {
+            "$ref": "#/components/schemas/UInt64String"
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "ActivityRowTombstone": {
+        "type": "object",
+        "required": [
+          "rowId",
+          "rowVersion",
+          "reason"
+        ],
+        "properties": {
+          "rowId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "rowVersion": {
+            "$ref": "#/components/schemas/UInt64String"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/TombstoneReason"
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "ActivityScope": {
+        "type": "object",
+        "required": [
+          "serverId",
+          "principalId",
+          "filter",
+          "windowId"
+        ],
+        "properties": {
+          "serverId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "principalId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "filter": {
+            "$ref": "#/components/schemas/ActivityFilter"
+          },
+          "windowId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "ActivityScopeState": {
+        "type": "object",
+        "required": [
+          "scope",
+          "epoch",
+          "watermark",
+          "activityVersion",
+          "revision",
+          "syncState",
+          "window"
+        ],
+        "properties": {
+          "scope": {
+            "$ref": "#/components/schemas/ActivityScope"
+          },
+          "epoch": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UInt64String"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "watermark": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UInt64String"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "activityVersion": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UInt64String"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "revision": {
+            "$ref": "#/components/schemas/UInt64String"
+          },
+          "syncState": {
+            "$ref": "#/components/schemas/ActivitySyncState"
+          },
+          "window": {
+            "$ref": "#/components/schemas/ActivityWindow"
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "ActivitySyncState": {
+        "type": "string",
+        "enum": [
+          "empty",
+          "loading",
+          "ready",
+          "stale",
+          "recovering"
+        ]
+      },
+      "ActivityWindow": {
+        "type": "object",
+        "required": [
+          "rows",
+          "tombstones",
+          "nextCursor",
+          "hasMore",
+          "complete",
+          "totalCount",
+          "totalUnreadCount"
+        ],
+        "properties": {
+          "rows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ActivityRow"
+            }
+          },
+          "tombstones": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ActivityRowTombstone"
+            }
+          },
+          "nextCursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "hasMore": {
+            "type": "boolean"
+          },
+          "complete": {
+            "type": "boolean"
+          },
+          "totalCount": {
+            "type": "integer",
+            "format": "uint32"
+          },
+          "totalUnreadCount": {
+            "type": "integer",
+            "format": "uint32"
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "ActorKind": {
+        "type": "string",
+        "enum": [
+          "user",
+          "agent",
+          "system",
+          "external_projection"
+        ]
+      },
+      "AffectedReadState": {
+        "type": "object",
+        "required": [
+          "scopeId",
+          "channelId",
+          "maxReadSeq",
+          "readStateVersion"
+        ],
+        "properties": {
+          "scopeId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "channelId": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OpaqueId"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "maxReadSeq": {
+            "$ref": "#/components/schemas/UInt64String"
+          },
+          "readStateVersion": {
+            "$ref": "#/components/schemas/UInt64String"
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "BadRequestResponse": {
+        "type": "object",
+        "required": [
+          "body"
+        ],
+        "properties": {
+          "body": {
+            "$ref": "#/components/schemas/ContractError"
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "ChannelActivityRow": {
+        "type": "object",
+        "required": [
+          "rowId",
+          "rowVersion",
+          "latestActivitySeq",
+          "lastActivityAt",
+          "unreadCount",
+          "hasMention",
+          "firstUnreadMessageId",
+          "firstMentionMessageId",
+          "maxReadSeq",
+          "readStateVersion",
+          "type",
+          "channelId",
+          "channelName",
+          "channelKind",
+          "lastMessageId",
+          "lastMessagePreview",
+          "lastMessageSenderKind",
+          "lastMessageSenderId",
+          "lastMessageSenderName"
+        ],
+        "properties": {
+          "rowId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "rowVersion": {
+            "$ref": "#/components/schemas/UInt64String"
+          },
+          "latestActivitySeq": {
+            "$ref": "#/components/schemas/UInt64String",
+            "description": "Authoritative content-frontier message seq (DB bigint canonical decimal string).\nThe Done/read/reactivation marker authority — replyCount is display-only and must\nnever veto it (task #361 three-axis contract). Required non-null: every row kind\ncarries it same-source (thread = latest reply seq, zero-reply = parent seq; channel/dm\n= last message seq; mention = mention seq). Canonical decimal string, no leading zeros,\nsafe up to 2^53."
+          },
+          "lastActivityAt": {
+            "$ref": "#/components/schemas/UtcInstantString"
+          },
+          "unreadCount": {
+            "type": "integer",
+            "format": "uint32"
+          },
+          "hasMention": {
+            "type": "boolean"
+          },
+          "firstUnreadMessageId": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OpaqueId"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "firstMentionMessageId": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OpaqueId"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "maxReadSeq": {
+            "$ref": "#/components/schemas/UInt64String"
+          },
+          "readStateVersion": {
+            "$ref": "#/components/schemas/UInt64String"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "channel"
+            ]
+          },
+          "channelId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "channelName": {
+            "type": "string"
+          },
+          "channelKind": {
+            "type": "string",
+            "enum": [
+              "channel",
+              "private",
+              "joint"
+            ]
+          },
+          "lastMessageId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "lastMessagePreview": {
+            "type": "string"
+          },
+          "lastMessageSenderKind": {
+            "$ref": "#/components/schemas/ActorKind"
+          },
+          "lastMessageSenderId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "lastMessageSenderName": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "ChannelKind": {
+        "type": "string",
+        "enum": [
+          "channel",
+          "private",
+          "joint",
+          "dm"
+        ]
+      },
+      "CheckpointFixtureStep": {
+        "type": "object",
+        "required": [
+          "type",
+          "stepId",
+          "checkpointId"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "checkpoint"
+            ]
+          },
+          "stepId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "checkpointId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "CommandReceiptIngress": {
+        "type": "object",
+        "required": [
+          "type",
+          "scope",
+          "receipt"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "commandReceipt"
+            ]
+          },
+          "scope": {
+            "$ref": "#/components/schemas/ActivityScope"
+          },
+          "receipt": {
+            "$ref": "#/components/schemas/ActivityCommandReceipt"
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "CommandRejectedIngress": {
+        "type": "object",
+        "required": [
+          "type",
+          "scope",
+          "commandId",
+          "activityVersion",
+          "error"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "commandRejected"
+            ]
+          },
+          "scope": {
+            "$ref": "#/components/schemas/ActivityScope"
+          },
+          "commandId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "activityVersion": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UInt64String"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "error": {
+            "$ref": "#/components/schemas/ContractError"
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "CommandRequest": {
+        "type": "object",
+        "required": [
+          "commandId",
+          "expectedActivityVersion"
+        ],
+        "properties": {
+          "commandId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "expectedActivityVersion": {
+            "$ref": "#/components/schemas/UInt64String"
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "ConflictResponse": {
+        "type": "object",
+        "required": [
+          "body"
+        ],
+        "properties": {
+          "body": {
+            "$ref": "#/components/schemas/ContractError"
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "ConstraintClass": {
+        "type": "string",
+        "enum": [
+          "positive",
+          "structural",
+          "valueDomain"
+        ]
+      },
+      "ContractError": {
+        "type": "object",
+        "required": [
+          "code",
+          "message",
+          "retryable"
+        ],
+        "properties": {
+          "code": {
+            "$ref": "#/components/schemas/ContractErrorCode"
+          },
+          "message": {
+            "type": "string"
+          },
+          "retryable": {
+            "type": "boolean"
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "ContractErrorCode": {
+        "type": "string",
+        "enum": [
+          "invalidRequest",
+          "staleVersion",
+          "unauthorized",
+          "forbidden",
+          "conflict",
+          "unavailable",
+          "internal"
+        ]
+      },
+      "ContractVectorEnvelope": {
+        "type": "object",
+        "required": [
+          "vectorId",
+          "constraintClass",
+          "candidate",
+          "expectation",
+          "reason"
+        ],
+        "properties": {
+          "vectorId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "constraintClass": {
+            "$ref": "#/components/schemas/ConstraintClass"
+          },
+          "candidate": {},
+          "expectation": {
+            "$ref": "#/components/schemas/ContractVectorExpectation"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "ContractVectorExpectation": {
+        "type": "object",
+        "required": [
+          "validator",
+          "typescriptStatic",
+          "kotlinRuntime"
+        ],
+        "properties": {
+          "validator": {
+            "$ref": "#/components/schemas/ContractVerdict"
+          },
+          "typescriptStatic": {
+            "$ref": "#/components/schemas/ContractVerdict"
+          },
+          "kotlinRuntime": {
+            "$ref": "#/components/schemas/ContractVerdict"
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "ContractVerdict": {
+        "type": "string",
+        "enum": [
+          "accept",
+          "reject",
+          "exempt"
+        ]
+      },
+      "DifferenceIngress": {
+        "type": "object",
+        "required": [
+          "type",
+          "requestId",
+          "scope",
+          "epoch",
+          "fromSeq",
+          "toSeq",
+          "activityVersion",
+          "rows",
+          "tombstones",
+          "nextCursor",
+          "hasMore",
+          "complete",
+          "totalCount",
+          "totalUnreadCount",
+          "nextFromSeq"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "difference"
+            ]
+          },
+          "requestId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/ActivityScope"
+          },
+          "epoch": {
+            "$ref": "#/components/schemas/UInt64String"
+          },
+          "fromSeq": {
+            "$ref": "#/components/schemas/UInt64String"
+          },
+          "toSeq": {
+            "$ref": "#/components/schemas/UInt64String"
+          },
+          "activityVersion": {
+            "$ref": "#/components/schemas/UInt64String"
+          },
+          "rows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ActivityRow"
+            }
+          },
+          "tombstones": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ActivityRowTombstone"
+            }
+          },
+          "nextCursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "hasMore": {
+            "type": "boolean"
+          },
+          "complete": {
+            "type": "boolean"
+          },
+          "totalCount": {
+            "type": "integer",
+            "format": "uint32"
+          },
+          "totalUnreadCount": {
+            "type": "integer",
+            "format": "uint32"
+          },
+          "nextFromSeq": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UInt64String"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "DispatchFixtureStep": {
+        "type": "object",
+        "required": [
+          "type",
+          "stepId",
+          "intent"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "dispatch"
+            ]
+          },
+          "stepId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "intent": {
+            "$ref": "#/components/schemas/ActivityIntent"
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "DmActivityRow": {
+        "type": "object",
+        "required": [
+          "rowId",
+          "rowVersion",
+          "latestActivitySeq",
+          "lastActivityAt",
+          "unreadCount",
+          "hasMention",
+          "firstUnreadMessageId",
+          "firstMentionMessageId",
+          "maxReadSeq",
+          "readStateVersion",
+          "type",
+          "channelId",
+          "channelName",
+          "channelKind",
+          "lastMessageId",
+          "lastMessagePreview",
+          "lastMessageSenderKind",
+          "lastMessageSenderId",
+          "lastMessageSenderName"
+        ],
+        "properties": {
+          "rowId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "rowVersion": {
+            "$ref": "#/components/schemas/UInt64String"
+          },
+          "latestActivitySeq": {
+            "$ref": "#/components/schemas/UInt64String",
+            "description": "Authoritative content-frontier message seq (DB bigint canonical decimal string).\nThe Done/read/reactivation marker authority — replyCount is display-only and must\nnever veto it (task #361 three-axis contract). Required non-null: every row kind\ncarries it same-source (thread = latest reply seq, zero-reply = parent seq; channel/dm\n= last message seq; mention = mention seq). Canonical decimal string, no leading zeros,\nsafe up to 2^53."
+          },
+          "lastActivityAt": {
+            "$ref": "#/components/schemas/UtcInstantString"
+          },
+          "unreadCount": {
+            "type": "integer",
+            "format": "uint32"
+          },
+          "hasMention": {
+            "type": "boolean"
+          },
+          "firstUnreadMessageId": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OpaqueId"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "firstMentionMessageId": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OpaqueId"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "maxReadSeq": {
+            "$ref": "#/components/schemas/UInt64String"
+          },
+          "readStateVersion": {
+            "$ref": "#/components/schemas/UInt64String"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "dm"
+            ]
+          },
+          "channelId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "channelName": {
+            "type": "string"
+          },
+          "channelKind": {
+            "type": "string",
+            "enum": [
+              "dm"
+            ]
+          },
+          "lastMessageId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "lastMessagePreview": {
+            "type": "string"
+          },
+          "lastMessageSenderKind": {
+            "$ref": "#/components/schemas/ActorKind"
+          },
+          "lastMessageSenderId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "lastMessageSenderName": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "EnsureWindowIntent": {
+        "type": "object",
+        "required": [
+          "type",
+          "scope"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "ensureWindow"
+            ]
+          },
+          "scope": {
+            "$ref": "#/components/schemas/ActivityScope"
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "FixtureInitialState": {
+        "type": "object",
+        "required": [
+          "scopes"
+        ],
+        "properties": {
+          "scopes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ActivityScopeState"
+            }
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "ForbiddenResponse": {
+        "type": "object",
+        "required": [
+          "body"
+        ],
+        "properties": {
+          "body": {
+            "$ref": "#/components/schemas/ContractError"
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "FrameIngress": {
+        "type": "object",
+        "required": [
+          "type",
+          "scope",
+          "epoch",
+          "seq",
+          "activityVersion",
+          "rows",
+          "tombstones"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "frame"
+            ]
+          },
+          "scope": {
+            "$ref": "#/components/schemas/ActivityScope"
+          },
+          "epoch": {
+            "$ref": "#/components/schemas/UInt64String"
+          },
+          "seq": {
+            "$ref": "#/components/schemas/UInt64String"
+          },
+          "activityVersion": {
+            "$ref": "#/components/schemas/UInt64String"
+          },
+          "rows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ActivityRow"
+            }
+          },
+          "tombstones": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ActivityRowTombstone"
+            }
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "InboxQuery": {
+        "type": "object",
+        "properties": {
+          "filter": {
+            "$ref": "#/components/schemas/ActivityFilter"
+          },
+          "cursor": {
+            "type": "string"
+          },
+          "limit": {
+            "type": "integer",
+            "format": "uint32"
+          },
+          "epoch": {
+            "$ref": "#/components/schemas/UInt64String"
+          },
+          "activityVersion": {
+            "$ref": "#/components/schemas/UInt64String"
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "IngestFixtureStep": {
+        "type": "object",
+        "required": [
+          "type",
+          "stepId",
+          "ingress"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "ingest"
+            ]
+          },
+          "stepId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "ingress": {
+            "$ref": "#/components/schemas/ActivityIngress"
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "LoadMoreIntent": {
+        "type": "object",
+        "required": [
+          "type",
+          "scope",
+          "cursor"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "loadMore"
+            ]
+          },
+          "scope": {
+            "$ref": "#/components/schemas/ActivityScope"
+          },
+          "cursor": {
+            "type": "string"
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "MarkChannelReadAllIntent": {
+        "type": "object",
+        "required": [
+          "type",
+          "scope",
+          "commandId",
+          "channelId",
+          "throughSeq"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "markChannelReadAll"
+            ]
+          },
+          "scope": {
+            "$ref": "#/components/schemas/ActivityScope"
+          },
+          "commandId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "channelId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "throughSeq": {
+            "$ref": "#/components/schemas/UInt64String"
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "MarkChannelReadAllRequest": {
+        "type": "object",
+        "required": [
+          "commandId",
+          "expectedActivityVersion",
+          "throughSeq"
+        ],
+        "properties": {
+          "commandId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "expectedActivityVersion": {
+            "$ref": "#/components/schemas/UInt64String"
+          },
+          "throughSeq": {
+            "$ref": "#/components/schemas/UInt64String"
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "MarkInboxDoneIntent": {
+        "type": "object",
+        "required": [
+          "type",
+          "scope",
+          "commandId",
+          "rowId",
+          "throughActivitySeq"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "markInboxDone"
+            ]
+          },
+          "scope": {
+            "$ref": "#/components/schemas/ActivityScope"
+          },
+          "commandId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "rowId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "throughActivitySeq": {
+            "$ref": "#/components/schemas/UInt64String",
+            "description": "Authoritative content-frontier seq this Done covers. Monotonic write:\nmust be a positive canonical decimal string (`0` is invalid);\nserver sets doneThrough = max(existing, throughActivitySeq) and rejects\nthroughActivitySeq > currentLatest with 409 + zero write (never clamps).\nReplaces the strict-CAS expectedRowVersion (task #361 Gate B2)."
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "MarkInboxReadAllIntent": {
+        "type": "object",
+        "required": [
+          "type",
+          "scope",
+          "commandId",
+          "throughSeq"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "markInboxReadAll"
+            ]
+          },
+          "scope": {
+            "$ref": "#/components/schemas/ActivityScope"
+          },
+          "commandId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "throughSeq": {
+            "$ref": "#/components/schemas/UInt64String"
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "MarkInboxReadAllRequest": {
+        "type": "object",
+        "required": [
+          "commandId",
+          "expectedActivityVersion",
+          "throughSeq"
+        ],
+        "properties": {
+          "commandId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "expectedActivityVersion": {
+            "$ref": "#/components/schemas/UInt64String"
+          },
+          "throughSeq": {
+            "$ref": "#/components/schemas/UInt64String"
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "MarkThreadDoneIntent": {
+        "type": "object",
+        "required": [
+          "type",
+          "scope",
+          "commandId",
+          "threadChannelId",
+          "throughActivitySeq"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "markThreadDone"
+            ]
+          },
+          "scope": {
+            "$ref": "#/components/schemas/ActivityScope"
+          },
+          "commandId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "threadChannelId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "throughActivitySeq": {
+            "$ref": "#/components/schemas/UInt64String",
+            "description": "Authoritative content-frontier seq this Done covers. Monotonic write:\nmust be a positive canonical decimal string (`0` is invalid);\nserver sets doneThrough = max(existing, throughActivitySeq) and rejects\nthroughActivitySeq > currentLatest with 409 + zero write (never clamps).\nReplaces the strict-CAS expectedRowVersion (task #361 Gate B2)."
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "NotFoundResponse": {
+        "type": "object",
+        "required": [
+          "body"
+        ],
+        "properties": {
+          "body": {
+            "$ref": "#/components/schemas/ContractError"
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        },
+        "description": "The server fail-closes with 404 rather than 403 for scope/permission\nfailures, so an unauthorized caller cannot probe existence. Verified against\nthe live routes (\"Thread not found\" / \"Chat not found\"), and it is the status"
+      },
+      "NotModifiedIngress": {
+        "type": "object",
+        "required": [
+          "type",
+          "requestId",
+          "scope",
+          "epoch",
+          "watermark",
+          "activityVersion"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "notModified"
+            ]
+          },
+          "requestId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/ActivityScope"
+          },
+          "epoch": {
+            "$ref": "#/components/schemas/UInt64String"
+          },
+          "watermark": {
+            "$ref": "#/components/schemas/UInt64String"
+          },
+          "activityVersion": {
+            "$ref": "#/components/schemas/UInt64String"
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "OpaqueId": {
+        "type": "string"
+      },
+      "ReadStateUpdatedIngress": {
+        "type": "object",
+        "required": [
+          "type",
+          "scope",
+          "epoch",
+          "seq",
+          "activityVersion",
+          "updates"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "readStateUpdated"
+            ]
+          },
+          "scope": {
+            "$ref": "#/components/schemas/ActivityScope"
+          },
+          "epoch": {
+            "$ref": "#/components/schemas/UInt64String"
+          },
+          "seq": {
+            "$ref": "#/components/schemas/UInt64String"
+          },
+          "activityVersion": {
+            "$ref": "#/components/schemas/UInt64String"
+          },
+          "updates": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AffectedReadState"
+            }
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "RefreshIntent": {
+        "type": "object",
+        "required": [
+          "type",
+          "scope"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "refresh"
+            ]
+          },
+          "scope": {
+            "$ref": "#/components/schemas/ActivityScope"
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "RestartFixtureStep": {
+        "type": "object",
+        "required": [
+          "type",
+          "stepId",
+          "mode"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "restart"
+            ]
+          },
+          "stepId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "cold",
+              "persisted"
+            ]
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "SafeUnsignedCounter": {
+        "type": "integer",
+        "format": "int64",
+        "minimum": 0,
+        "maximum": 9007199254740991,
+        "description": "Legacy lossy counter: a JSON number trustworthy only within the JS safe-integer range. Bounds are explicit because bare `safeint` emitted an unbounded integer to JSON Schema and `format: int64` to OpenAPI, overstating a range the wire cannot carry."
+      },
+      "SnapshotIngress": {
+        "type": "object",
+        "required": [
+          "type",
+          "requestId",
+          "scope",
+          "epoch",
+          "watermark",
+          "activityVersion",
+          "window"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "snapshot"
+            ]
+          },
+          "requestId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/ActivityScope"
+          },
+          "epoch": {
+            "$ref": "#/components/schemas/UInt64String"
+          },
+          "watermark": {
+            "$ref": "#/components/schemas/UInt64String"
+          },
+          "activityVersion": {
+            "$ref": "#/components/schemas/UInt64String"
+          },
+          "window": {
+            "$ref": "#/components/schemas/ActivityWindow"
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "SnapshotRequiredBody": {
+        "type": "object",
+        "required": [
+          "snapshotRequired",
+          "requestId",
+          "scope",
+          "epoch",
+          "watermark",
+          "activityVersion"
+        ],
+        "properties": {
+          "snapshotRequired": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          },
+          "requestId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/ActivityScope"
+          },
+          "epoch": {
+            "$ref": "#/components/schemas/UInt64String"
+          },
+          "watermark": {
+            "$ref": "#/components/schemas/UInt64String"
+          },
+          "activityVersion": {
+            "$ref": "#/components/schemas/UInt64String"
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        },
+        "description": "Explicit repair outcome. A caller with an old epoch, a future watermark, or\na watermark older than the retained dense journal must fetch a snapshot;\nthe server never fabricates continuity."
+      },
+      "ThreadActivityRow": {
+        "type": "object",
+        "required": [
+          "rowId",
+          "rowVersion",
+          "latestActivitySeq",
+          "lastActivityAt",
+          "unreadCount",
+          "hasMention",
+          "firstUnreadMessageId",
+          "firstMentionMessageId",
+          "maxReadSeq",
+          "readStateVersion",
+          "type",
+          "threadChannelId",
+          "parentMessageId",
+          "parentChannelId",
+          "parentChannelName",
+          "parentChannelKind",
+          "parentMessagePreview",
+          "parentMessageSenderKind",
+          "parentMessageSenderId",
+          "latestActivityPreview",
+          "latestActivitySenderKind",
+          "latestActivitySenderId",
+          "latestActivitySenderName",
+          "latestActivityMessageId",
+          "isFollowing",
+          "replyCount",
+          "lastReplyAt",
+          "taskNumber",
+          "taskStatus",
+          "taskClaimedByName"
+        ],
+        "properties": {
+          "rowId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "rowVersion": {
+            "$ref": "#/components/schemas/UInt64String"
+          },
+          "latestActivitySeq": {
+            "$ref": "#/components/schemas/UInt64String",
+            "description": "Authoritative content-frontier message seq (DB bigint canonical decimal string).\nThe Done/read/reactivation marker authority — replyCount is display-only and must\nnever veto it (task #361 three-axis contract). Required non-null: every row kind\ncarries it same-source (thread = latest reply seq, zero-reply = parent seq; channel/dm\n= last message seq; mention = mention seq). Canonical decimal string, no leading zeros,\nsafe up to 2^53."
+          },
+          "lastActivityAt": {
+            "$ref": "#/components/schemas/UtcInstantString"
+          },
+          "unreadCount": {
+            "type": "integer",
+            "format": "uint32"
+          },
+          "hasMention": {
+            "type": "boolean"
+          },
+          "firstUnreadMessageId": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OpaqueId"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "firstMentionMessageId": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OpaqueId"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "maxReadSeq": {
+            "$ref": "#/components/schemas/UInt64String"
+          },
+          "readStateVersion": {
+            "$ref": "#/components/schemas/UInt64String"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "thread"
+            ]
+          },
+          "threadChannelId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "parentMessageId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "parentChannelId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "parentChannelName": {
+            "type": "string"
+          },
+          "parentChannelKind": {
+            "$ref": "#/components/schemas/ChannelKind"
+          },
+          "parentMessagePreview": {
+            "type": "string"
+          },
+          "parentMessageSenderKind": {
+            "type": "string",
+            "enum": [
+              "user",
+              "agent",
+              "external_projection"
+            ]
+          },
+          "parentMessageSenderId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "latestActivityPreview": {
+            "type": "string"
+          },
+          "latestActivitySenderKind": {
+            "$ref": "#/components/schemas/ActorKind"
+          },
+          "latestActivitySenderId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "latestActivitySenderName": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "latestActivityMessageId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "isFollowing": {
+            "type": "boolean",
+            "description": "Follow state affects controls and attention only. Unfollowed rows remain\nin the All feed while not Done, with unreadCount=0 and hasMention=false."
+          },
+          "replyCount": {
+            "type": "integer",
+            "format": "uint32"
+          },
+          "lastReplyAt": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UtcInstantString"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "taskNumber": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "format": "uint32"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "taskStatus": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "taskClaimedByName": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "TombstoneReason": {
+        "type": "string",
+        "enum": [
+          "done",
+          "deleted",
+          "outOfWindow"
+        ]
+      },
+      "UInt64String": {
+        "type": "string",
+        "pattern": "^(0|[1-9][0-9]*)$"
+      },
+      "UnauthorizedResponse": {
+        "type": "object",
+        "required": [
+          "body"
+        ],
+        "properties": {
+          "body": {
+            "$ref": "#/components/schemas/ContractError"
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "UnavailableResponse": {
+        "type": "object",
+        "required": [
+          "body"
+        ],
+        "properties": {
+          "body": {
+            "$ref": "#/components/schemas/ContractError"
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "UtcInstantString": {
+        "type": "string"
+      },
+      "V1AckResponse": {
+        "type": "object",
+        "required": [
+          "ok"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        },
+        "description": "Both `done` routes return only an HTTP-success acknowledgement today."
+      },
+      "V1AdmittedResponse": {
+        "type": "object",
+        "required": [
+          "code",
+          "status",
+          "outcome",
+          "mutationId",
+          "authoritySeq",
+          "frontierUrl"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "admitted"
+            ]
+          },
+          "outcome": {
+            "type": "string",
+            "enum": [
+              "unknown"
+            ]
+          },
+          "mutationId": {
+            "type": "string"
+          },
+          "authoritySeq": {
+            "$ref": "#/components/schemas/SafeUnsignedCounter"
+          },
+          "frontierUrl": {
+            "type": "string"
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        },
+        "description": "Real 202 admission outcome (`sendCompatibilityReadPending`).\n\nA compatibility read-mutation may be admitted rather than committed; the\ncaller must poll `frontierUrl`. This existed in production and was entirely\nabsent from the contract, so a generated client had no way to represent\n\"accepted, outcome unknown\" and would treat it as an unexpected status."
+      },
+      "V1AffectedReadState": {
+        "type": "object",
+        "required": [
+          "scopeId",
+          "maxReadSeq",
+          "readStateVersion"
+        ],
+        "properties": {
+          "scopeId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "maxReadSeq": {
+            "$ref": "#/components/schemas/SafeUnsignedCounter"
+          },
+          "readStateVersion": {
+            "$ref": "#/components/schemas/SafeUnsignedCounter"
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "V1AuthErrorBody": {
+        "type": "object",
+        "required": [
+          "error",
+          "code"
+        ],
+        "properties": {
+          "error": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        },
+        "description": "`requireAuth` adds a machine-readable `code` alongside the message."
+      },
+      "V1DoneBadRequestBody": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        },
+        "description": "Done shares legacy request validation with a machine-readable frontier gate."
+      },
+      "V1DoneConflictBody": {
+        "type": "object",
+        "required": [
+          "error",
+          "code"
+        ],
+        "properties": {
+          "error": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "V1ErrorBody": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string"
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "V1InboxPage": {
+        "type": "object",
+        "required": [
+          "items",
+          "hasMore",
+          "totalCount",
+          "totalUnreadCount",
+          "activeUnreadCount"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {}
+          },
+          "hasMore": {
+            "type": "boolean"
+          },
+          "totalCount": {
+            "$ref": "#/components/schemas/SafeUnsignedCounter"
+          },
+          "totalUnreadCount": {
+            "$ref": "#/components/schemas/SafeUnsignedCounter"
+          },
+          "activeUnreadCount": {
+            "$ref": "#/components/schemas/SafeUnsignedCounter"
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        },
+        "description": "Real `GET /api/channels/inbox` page body.\n\nThe contract declared this route as returning the future sync ingress union\n(SnapshotIngress or DifferenceIngress). The live route returns an inbox PAGE.\nThat declaration survived three earlier corrections because the audits\ntargeted the write routes and never questioned the read."
+      },
+      "V1MarkChannelReadAllResponse": {
+        "type": "object",
+        "required": [
+          "ok",
+          "seq",
+          "readStateVersion"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          },
+          "seq": {
+            "$ref": "#/components/schemas/SafeUnsignedCounter"
+          },
+          "readStateVersion": {
+            "$ref": "#/components/schemas/SafeUnsignedCounter"
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "V1MarkInboxDoneRequest": {
+        "type": "object",
+        "required": [
+          "channelId",
+          "throughActivitySeq",
+          "frontierSpace"
+        ],
+        "properties": {
+          "channelId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "throughActivitySeq": {
+            "$ref": "#/components/schemas/UInt64String",
+            "description": "Positive canonical decimal content frontier; `0` is invalid."
+          },
+          "frontierSpace": {
+            "type": "string",
+            "enum": [
+              "storage"
+            ],
+            "description": "Sequence-space identity required before the strict Done guard runs."
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        },
+        "description": "V1 error body — what every route-level failure actually returns.\n\nThe contract previously declared `ContractError {code,message,retryable}`,\nwhich no route emits. The real shape is a single `error` string; a client\ngenerated from the old contract could not decode a 400/404/500 at all.Real V1 request bodies, taken from the router.\n\nThe contract previously required `commandId`/`expectedActivityVersion`/\n`throughSeq` on all four routes — V2 vocabulary the server never reads —\nwhile omitting the only fields it does read. A client generated from that\nwould have sent the wrong payload to every write route."
+      },
+      "V1MarkInboxReadAllResponse": {
+        "type": "object",
+        "required": [
+          "ok",
+          "markedCount",
+          "scopes"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "enum": [
+              true
+            ],
+            "description": "Literal: the server only emits this body on success."
+          },
+          "markedCount": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "scopes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/V1AffectedReadState"
+            }
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      },
+      "V1MarkThreadDoneRequest": {
+        "type": "object",
+        "required": [
+          "threadChannelId",
+          "throughActivitySeq",
+          "frontierSpace"
+        ],
+        "properties": {
+          "threadChannelId": {
+            "$ref": "#/components/schemas/OpaqueId"
+          },
+          "throughActivitySeq": {
+            "$ref": "#/components/schemas/UInt64String",
+            "description": "Positive canonical decimal content frontier; `0` is invalid."
+          },
+          "frontierSpace": {
+            "type": "string",
+            "enum": [
+              "storage"
+            ],
+            "description": "Sequence-space identity required before the strict Done guard runs."
+          }
+        },
+        "unevaluatedProperties": {
+          "not": {}
+        }
+      }
+    }
+  }
+}

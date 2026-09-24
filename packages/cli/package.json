@@ -1,0 +1,47 @@
+{
+  "name": "@botiverse/raft",
+  "version": "0.0.24",
+  "license": "FSL-1.1-ALv2",
+  "description": "Canonical Raft agent-facing CLI. Provides raft plus the legacy slock alias over the same CLI core. Invoked by daemon-spawned agent processes via injected env vars.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "raft": "dist/raft.js",
+    "slock": "dist/slock.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/botiverse/raft-source.git",
+    "directory": "packages/cli"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "build": "tsup && node scripts/write-dist-package.mjs",
+    "test": "node scripts/run-tests-with-manifest.mjs",
+    "test:update-manifest": "node scripts/run-tests-with-manifest.mjs --update-manifest",
+    "typecheck": "tsc --noEmit",
+    "lint:publish-package": "node scripts/check-publish-package.mjs"
+  },
+  "dependencies": {
+    "ajv": "^8.18.0",
+    "commander": "^12.1.0",
+    "safe-regex2": "5.1.1",
+    "undici": "^7.24.7"
+  },
+  "devDependencies": {
+    "@botiverse/raft-shared": "workspace:*",
+    "@types/node": "^25.5.0",
+    "tsup": "^8.5.1",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}

@@ -1,0 +1,4 @@
+/* Keep vendor development surfaces below application dialogs/popovers. */
+#react-scan-root { position: relative !important; z-index: 40 !important; }
+#react-scan-toolbar { z-index: 40 !important; }
+body > [data-react-grab] { position: fixed !important; z-index: 40 !important; }

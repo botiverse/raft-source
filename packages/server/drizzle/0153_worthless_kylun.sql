@@ -1,0 +1,1 @@
+CREATE INDEX "idx_channel_agents_agent_channel" ON "channel_agents" USING btree ("agent_id","channel_id");

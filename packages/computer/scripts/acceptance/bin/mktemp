@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+
+path=$(/usr/bin/mktemp "$@")
+canonical=$(/usr/bin/python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$path")
+if [ -n "${RAFT_ACCEPTANCE_MKTEMP_LOG:-}" ]; then
+  printf '%s\t%s\n' "$path" "$canonical" >> "$RAFT_ACCEPTANCE_MKTEMP_LOG"
+fi
+printf '%s\n' "$path"

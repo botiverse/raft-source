@@ -1,0 +1,14 @@
+# Formal macOS release overlay. The base config remains usable for unsigned
+# local/dev artifacts; this overlay fails closed unless a Developer ID
+# Application identity is available in the job's temporary keychain.
+
+extends: ./electron-builder.yml
+
+mac:
+  forceCodeSigning: true
+  notarize: false
+  entitlements: assets/entitlements.mac.plist
+  entitlementsInherit: assets/entitlements.mac.inherit.plist
+
+dmg:
+  sign: true

@@ -1,0 +1,905 @@
+{
+  "manifest": {
+    "valid": [
+      {
+        "name": "compatible",
+        "expectedReason": null,
+        "value": {
+          "manifestVersion": 1,
+          "frontendReleaseId": "release-2026-07-21-prod",
+          "frontendCommitSha": "0123456789abcdef0123456789abcdef01234567",
+          "compatibility": {
+            "appSemver": ">=1.0.0, <2.0.0",
+            "protocolMin": 1,
+            "protocolMax": 1,
+            "requiredCapabilities": [
+              "desktop.handshake",
+              "window.focus"
+            ]
+          },
+          "updateRecommendation": "current"
+        }
+      },
+      {
+        "name": "compound-too-old",
+        "expectedReason": "desktop_too_old",
+        "value": {
+          "manifestVersion": 1,
+          "frontendReleaseId": "release-2026-08-01-prod",
+          "frontendCommitSha": "123456789abcdef0123456789abcdef012345678",
+          "compatibility": {
+            "appSemver": ">=2.0.0, <3.0.0",
+            "protocolMin": 2,
+            "protocolMax": 2,
+            "requiredCapabilities": [
+              "desktop.handshake",
+              "window.focus"
+            ]
+          },
+          "updateRecommendation": "recommended"
+        }
+      },
+      {
+        "name": "compound-too-new",
+        "expectedReason": "desktop_too_new",
+        "value": {
+          "manifestVersion": 1,
+          "frontendReleaseId": "rollback-2026-07-20",
+          "frontendCommitSha": "abcdef0123456789abcdef0123456789abcdef01",
+          "compatibility": {
+            "appSemver": ">=0.5.0, <1.0.0",
+            "protocolMin": 1,
+            "protocolMax": 1,
+            "requiredCapabilities": []
+          },
+          "updateRecommendation": "none"
+        }
+      }
+    ],
+    "invalid": [
+      {
+        "name": "unknown-manifest-version",
+        "value": {
+          "manifestVersion": 2,
+          "frontendReleaseId": "release",
+          "frontendCommitSha": "0123456789abcdef0123456789abcdef01234567",
+          "compatibility": {
+            "appSemver": ">=1.0.0",
+            "protocolMin": 1,
+            "protocolMax": 1,
+            "requiredCapabilities": []
+          },
+          "updateRecommendation": "current"
+        }
+      },
+      {
+        "name": "short-commit-sha",
+        "value": {
+          "manifestVersion": 1,
+          "frontendReleaseId": "release",
+          "frontendCommitSha": "abc1234",
+          "compatibility": {
+            "appSemver": ">=1.0.0",
+            "protocolMin": 1,
+            "protocolMax": 1,
+            "requiredCapabilities": []
+          },
+          "updateRecommendation": "current"
+        }
+      },
+      {
+        "name": "duplicate-capability",
+        "value": {
+          "manifestVersion": 1,
+          "frontendReleaseId": "release",
+          "frontendCommitSha": "0123456789abcdef0123456789abcdef01234567",
+          "compatibility": {
+            "appSemver": ">=1.0.0",
+            "protocolMin": 1,
+            "protocolMax": 1,
+            "requiredCapabilities": [
+              "window.focus",
+              "window.focus"
+            ]
+          },
+          "updateRecommendation": "current"
+        }
+      },
+      {
+        "name": "unknown-field",
+        "value": {
+          "manifestVersion": 1,
+          "frontendReleaseId": "release",
+          "frontendCommitSha": "0123456789abcdef0123456789abcdef01234567",
+          "compatibility": {
+            "appSemver": ">=1.0.0",
+            "protocolMin": 1,
+            "protocolMax": 1,
+            "requiredCapabilities": []
+          },
+          "updateRecommendation": "current",
+          "extra": true
+        }
+      },
+      {
+        "name": "protocol-range-inverted",
+        "schemaInvalid": false,
+        "value": {
+          "manifestVersion": 1,
+          "frontendReleaseId": "release",
+          "frontendCommitSha": "0123456789abcdef0123456789abcdef01234567",
+          "compatibility": {
+            "appSemver": ">=1.0.0",
+            "protocolMin": 3,
+            "protocolMax": 2,
+            "requiredCapabilities": []
+          },
+          "updateRecommendation": "current"
+        }
+      },
+      {
+        "name": "invalid-semver-requirement",
+        "value": {
+          "manifestVersion": 1,
+          "frontendReleaseId": "release",
+          "frontendCommitSha": "0123456789abcdef0123456789abcdef01234567",
+          "compatibility": {
+            "appSemver": "definitely-not-semver",
+            "protocolMin": 1,
+            "protocolMax": 1,
+            "requiredCapabilities": []
+          },
+          "updateRecommendation": "current"
+        }
+      }
+    ]
+  },
+  "uri": {
+    "valid": [
+      {
+        "name": "open",
+        "uri": "raft://v1/open/550e8400-e29b-41d4-a716-446655440000",
+        "action": "open"
+      },
+      {
+        "name": "channel-message",
+        "uri": "raft://v1/channel/550e8400-e29b-41d4-a716-446655440000/channel-1?msg=message-1",
+        "action": "channel"
+      },
+      {
+        "name": "dm-thread",
+        "uri": "raft://v1/dm/550e8400-e29b-41d4-a716-446655440000/dm-1?thread=parent-1",
+        "action": "dm"
+      },
+      {
+        "name": "encoded-space",
+        "uri": "raft://v1/channel/550e8400-e29b-41d4-a716-446655440000/channel%20one",
+        "action": "channel"
+      }
+    ],
+    "invalid": [
+      {
+        "name": "missing-channel-context",
+        "uri": "raft://v1/channel/550e8400-e29b-41d4-a716-446655440000"
+      },
+      {
+        "name": "missing-dm-context",
+        "uri": "raft://v1/dm/550e8400-e29b-41d4-a716-446655440000"
+      },
+      {
+        "name": "empty-context",
+        "uri": "raft://v1/channel/550e8400-e29b-41d4-a716-446655440000/"
+      },
+      {
+        "name": "repeated-slash",
+        "uri": "raft://v1/channel/550e8400-e29b-41d4-a716-446655440000//channel-1"
+      },
+      {
+        "name": "extra-segment",
+        "uri": "raft://v1/channel/550e8400-e29b-41d4-a716-446655440000/channel-1/extra"
+      },
+      {
+        "name": "open-with-context",
+        "uri": "raft://v1/open/550e8400-e29b-41d4-a716-446655440000/extra"
+      },
+      {
+        "name": "empty-query",
+        "uri": "raft://v1/channel/550e8400-e29b-41d4-a716-446655440000/channel-1?msg="
+      },
+      {
+        "name": "duplicate-query",
+        "uri": "raft://v1/channel/550e8400-e29b-41d4-a716-446655440000/channel-1?msg=a&msg=b"
+      },
+      {
+        "name": "unknown-query",
+        "uri": "raft://v1/channel/550e8400-e29b-41d4-a716-446655440000/channel-1?next=x"
+      },
+      {
+        "name": "encoded-slash",
+        "uri": "raft://v1/channel/550e8400-e29b-41d4-a716-446655440000/channel%2Fescape"
+      },
+      {
+        "name": "encoded-backslash",
+        "uri": "raft://v1/channel/550e8400-e29b-41d4-a716-446655440000/channel%5Cescape"
+      },
+      {
+        "name": "encoded-control",
+        "uri": "raft://v1/channel/550e8400-e29b-41d4-a716-446655440000/channel%00escape"
+      },
+      {
+        "name": "fragment",
+        "uri": "raft://v1/open/550e8400-e29b-41d4-a716-446655440000#fragment"
+      },
+      {
+        "name": "userinfo",
+        "uri": "raft://user:pass@v1/open/550e8400-e29b-41d4-a716-446655440000"
+      },
+      {
+        "name": "wrong-version",
+        "uri": "raft://v2/open/550e8400-e29b-41d4-a716-446655440000"
+      }
+    ]
+  },
+  "ipc": {
+    "valid": [
+      {
+        "name": "handshake",
+        "value": {
+          "method": "desktop.handshake",
+          "version": 1,
+          "params": {
+            "frontendReleaseId": "release-1",
+            "protocolVersion": 1,
+            "capabilities": [
+              "desktop.handshake",
+              "window.focus"
+            ],
+            "documentGeneration": 7,
+            "documentNonce": "6edbdb72-a002-4b13-b9ee-68d21ae36c34",
+            "environmentId": "production",
+            "environmentGeneration": 3
+          }
+        }
+      },
+      {
+        "name": "handshake-open-server-v1-ack",
+        "value": {
+          "method": "desktop.handshake",
+          "version": 1,
+          "params": {
+            "frontendReleaseId": "release-1",
+            "protocolVersion": 1,
+            "capabilities": [
+              "desktop.handshake",
+              "window.focus"
+            ],
+            "documentGeneration": 7,
+            "documentNonce": "6edbdb72-a002-4b13-b9ee-68d21ae36c34",
+            "environmentId": "production",
+            "environmentGeneration": 3,
+            "openServerCapabilityAck": 1
+          }
+        }
+      },
+      {
+        "name": "focus",
+        "value": {
+          "method": "window.focus",
+          "version": 1,
+          "params": {}
+        }
+      },
+      {
+        "name": "bind-server",
+        "value": {
+          "method": "window.bindServer",
+          "version": 1,
+          "params": {
+            "serverId": "550e8400-e29b-41d4-a716-446655440000",
+            "documentGeneration": 7,
+            "documentNonce": "6edbdb72-a002-4b13-b9ee-68d21ae36c34"
+          }
+        }
+      },
+      {
+        "name": "open-server-window",
+        "value": {
+          "method": "window.openServer",
+          "version": 1,
+          "params": {
+            "serverId": "550e8400-e29b-41d4-a716-446655440001",
+            "documentGeneration": 7,
+            "documentNonce": "6edbdb72-a002-4b13-b9ee-68d21ae36c34"
+          }
+        }
+      },
+      {
+        "name": "recovery-retry",
+        "value": {
+          "method": "recovery.retry",
+          "version": 1,
+          "params": {}
+        }
+      },
+      {
+        "name": "recovery-quit",
+        "value": {
+          "method": "recovery.quit",
+          "version": 1,
+          "params": {}
+        }
+      },
+      {
+        "name": "set-server-title-fallback",
+        "value": {
+          "method": "window.setServerTitle",
+          "version": 1,
+          "params": {
+            "documentGeneration": 7,
+            "documentNonce": "6edbdb72-a002-4b13-b9ee-68d21ae36c34",
+            "title": "Raft"
+          }
+        }
+      },
+      {
+        "name": "set-server-title-server-name",
+        "value": {
+          "method": "window.setServerTitle",
+          "version": 1,
+          "params": {
+            "documentGeneration": 7,
+            "documentNonce": "6edbdb72-a002-4b13-b9ee-68d21ae36c34",
+            "title": "My Server | Raft"
+          }
+        }
+      },
+      {
+        "name": "set-server-title-unicode-prefix",
+        "value": {
+          "method": "window.setServerTitle",
+          "version": 1,
+          "params": {
+            "documentGeneration": 7,
+            "documentNonce": "6edbdb72-a002-4b13-b9ee-68d21ae36c34",
+            "title": "团队 Server | Raft"
+          }
+        }
+      }
+    ],
+    "invalid": [
+      {
+        "name": "unknown-method",
+        "value": {
+          "method": "session.getRawToken",
+          "version": 1,
+          "params": {}
+        }
+      },
+      {
+        "name": "wrong-version",
+        "value": {
+          "method": "window.focus",
+          "version": 2,
+          "params": {}
+        }
+      },
+      {
+        "name": "extra-empty-param",
+        "value": {
+          "method": "recovery.quit",
+          "version": 1,
+          "params": {
+            "force": true
+          }
+        }
+      },
+      {
+        "name": "duplicate-handshake-capability",
+        "value": {
+          "method": "desktop.handshake",
+          "version": 1,
+          "params": {
+            "frontendReleaseId": "release-1",
+            "protocolVersion": 1,
+            "capabilities": [
+              "window.focus",
+              "window.focus"
+            ],
+            "documentGeneration": 7,
+            "documentNonce": "6edbdb72-a002-4b13-b9ee-68d21ae36c34"
+          }
+        }
+      },
+      {
+        "name": "wrong-open-server-capability-ack",
+        "value": {
+          "method": "desktop.handshake",
+          "version": 1,
+          "params": {
+            "frontendReleaseId": "release-1",
+            "protocolVersion": 1,
+            "capabilities": [
+              "desktop.handshake",
+              "window.focus"
+            ],
+            "documentGeneration": 7,
+            "documentNonce": "6edbdb72-a002-4b13-b9ee-68d21ae36c34",
+            "environmentId": "production",
+            "environmentGeneration": 3,
+            "openServerCapabilityAck": 2
+          }
+        }
+      },
+      {
+        "name": "missing-document-identity",
+        "value": {
+          "method": "desktop.handshake",
+          "version": 1,
+          "params": {
+            "frontendReleaseId": "release-1",
+            "protocolVersion": 1,
+            "capabilities": [
+              "desktop.handshake",
+              "window.focus"
+            ]
+          }
+        }
+      },
+      {
+        "name": "invalid-document-generation",
+        "value": {
+          "method": "desktop.handshake",
+          "version": 1,
+          "params": {
+            "frontendReleaseId": "release-1",
+            "protocolVersion": 1,
+            "capabilities": [
+              "desktop.handshake",
+              "window.focus"
+            ],
+            "documentGeneration": 0,
+            "documentNonce": "6edbdb72-a002-4b13-b9ee-68d21ae36c34"
+          }
+        }
+      },
+      {
+        "name": "unknown-envelope-field",
+        "value": {
+          "method": "window.focus",
+          "version": 1,
+          "params": {},
+          "extra": true
+        }
+      },
+      {
+        "name": "bind-server-non-uuid",
+        "value": {
+          "method": "window.bindServer",
+          "version": 1,
+          "params": {
+            "serverId": "botiverse",
+            "documentGeneration": 7,
+            "documentNonce": "nonce"
+          }
+        }
+      },
+      {
+        "name": "bind-server-unknown-field",
+        "value": {
+          "method": "window.bindServer",
+          "version": 1,
+          "params": {
+            "serverId": "550e8400-e29b-41d4-a716-446655440000",
+            "documentGeneration": 7,
+            "documentNonce": "nonce",
+            "intent": "openFromSlug"
+          }
+        }
+      },
+      {
+        "name": "bind-server-renderer-routing-field",
+        "value": {
+          "method": "window.openServer",
+          "version": 1,
+          "params": {
+            "serverId": "550e8400-e29b-41d4-a716-446655440000",
+            "documentGeneration": 7,
+            "documentNonce": "nonce",
+            "serverUrl": "https://attacker.example/s/slug"
+          }
+        }
+      },
+      {
+        "name": "set-server-title-not-trimmed",
+        "value": {
+          "method": "window.setServerTitle",
+          "version": 1,
+          "params": {
+            "documentGeneration": 7,
+            "documentNonce": "6edbdb72-a002-4b13-b9ee-68d21ae36c34",
+            "title": " Raft"
+          }
+        }
+      },
+      {
+        "name": "set-server-title-trailing-space",
+        "value": {
+          "method": "window.setServerTitle",
+          "version": 1,
+          "params": {
+            "documentGeneration": 7,
+            "documentNonce": "6edbdb72-a002-4b13-b9ee-68d21ae36c34",
+            "title": "Raft "
+          }
+        }
+      },
+      {
+        "name": "set-server-title-control-char",
+        "value": {
+          "method": "window.setServerTitle",
+          "version": 1,
+          "params": {
+            "documentGeneration": 7,
+            "documentNonce": "6edbdb72-a002-4b13-b9ee-68d21ae36c34",
+            "title": "My\u0001Server | Raft"
+          }
+        }
+      },
+      {
+        "name": "set-server-title-c1-control",
+        "value": {
+          "method": "window.setServerTitle",
+          "version": 1,
+          "params": {
+            "documentGeneration": 7,
+            "documentNonce": "6edbdb72-a002-4b13-b9ee-68d21ae36c34",
+            "title": "MyServer | Raft"
+          }
+        }
+      },
+      {
+        "name": "set-server-title-bidi-override",
+        "value": {
+          "method": "window.setServerTitle",
+          "version": 1,
+          "params": {
+            "documentGeneration": 7,
+            "documentNonce": "6edbdb72-a002-4b13-b9ee-68d21ae36c34",
+            "title": "My‮Server | Raft"
+          }
+        }
+      },
+      {
+        "name": "set-server-title-bidi-isolate",
+        "value": {
+          "method": "window.setServerTitle",
+          "version": 1,
+          "params": {
+            "documentGeneration": 7,
+            "documentNonce": "6edbdb72-a002-4b13-b9ee-68d21ae36c34",
+            "title": "My⁦Server | Raft"
+          }
+        }
+      },
+      {
+        "name": "set-server-title-lrm",
+        "value": {
+          "method": "window.setServerTitle",
+          "version": 1,
+          "params": {
+            "documentGeneration": 7,
+            "documentNonce": "6edbdb72-a002-4b13-b9ee-68d21ae36c34",
+            "title": "My‎Server | Raft"
+          }
+        }
+      },
+      {
+        "name": "set-server-title-too-long",
+        "value": {
+          "method": "window.setServerTitle",
+          "version": 1,
+          "params": {
+            "documentGeneration": 7,
+            "documentNonce": "6edbdb72-a002-4b13-b9ee-68d21ae36c34",
+            "title": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA | Raft"
+          }
+        }
+      },
+      {
+        "name": "set-server-title-bad-suffix",
+        "value": {
+          "method": "window.setServerTitle",
+          "version": 1,
+          "params": {
+            "documentGeneration": 7,
+            "documentNonce": "6edbdb72-a002-4b13-b9ee-68d21ae36c34",
+            "title": "My Server"
+          }
+        }
+      },
+      {
+        "name": "set-server-title-wrong-suffix",
+        "value": {
+          "method": "window.setServerTitle",
+          "version": 1,
+          "params": {
+            "documentGeneration": 7,
+            "documentNonce": "6edbdb72-a002-4b13-b9ee-68d21ae36c34",
+            "title": "My Server | Other"
+          }
+        }
+      },
+      {
+        "name": "set-server-title-empty-prefix",
+        "value": {
+          "method": "window.setServerTitle",
+          "version": 1,
+          "params": {
+            "documentGeneration": 7,
+            "documentNonce": "6edbdb72-a002-4b13-b9ee-68d21ae36c34",
+            "title": " | Raft"
+          }
+        }
+      },
+      {
+        "name": "set-server-title-empty",
+        "value": {
+          "method": "window.setServerTitle",
+          "version": 1,
+          "params": {
+            "documentGeneration": 7,
+            "documentNonce": "6edbdb72-a002-4b13-b9ee-68d21ae36c34",
+            "title": ""
+          }
+        }
+      },
+      {
+        "name": "set-server-title-missing-title",
+        "value": {
+          "method": "window.setServerTitle",
+          "version": 1,
+          "params": {
+            "documentGeneration": 7,
+            "documentNonce": "6edbdb72-a002-4b13-b9ee-68d21ae36c34"
+          }
+        }
+      },
+      {
+        "name": "set-server-title-missing-nonce",
+        "value": {
+          "method": "window.setServerTitle",
+          "version": 1,
+          "params": {
+            "documentGeneration": 7,
+            "title": "Raft"
+          }
+        }
+      },
+      {
+        "name": "set-server-title-zero-generation",
+        "value": {
+          "method": "window.setServerTitle",
+          "version": 1,
+          "params": {
+            "documentGeneration": 0,
+            "documentNonce": "6edbdb72-a002-4b13-b9ee-68d21ae36c34",
+            "title": "Raft"
+          }
+        }
+      },
+      {
+        "name": "set-server-title-extra-field",
+        "value": {
+          "method": "window.setServerTitle",
+          "version": 1,
+          "params": {
+            "documentGeneration": 7,
+            "documentNonce": "6edbdb72-a002-4b13-b9ee-68d21ae36c34",
+            "title": "Raft",
+            "route": "/s/x"
+          }
+        }
+      }
+    ]
+  },
+  "ipcResponses": {
+    "valid": [
+      {
+        "name": "handshake-ok",
+        "value": {
+          "method": "desktop.handshake",
+          "status": "ok",
+          "result": {
+            "compatibilityState": "readyFull",
+            "documentGeneration": 7,
+            "environmentId": "production",
+            "environmentGeneration": 3
+          }
+        }
+      },
+      {
+        "name": "handshake-error",
+        "value": {
+          "method": "desktop.handshake",
+          "status": "error",
+          "error": {
+            "code": "HANDSHAKE_MISMATCH",
+            "message": "Frontend release ID mismatch",
+            "retryable": false
+          }
+        }
+      },
+      {
+        "name": "focus-ok",
+        "value": {
+          "method": "window.focus",
+          "status": "ok",
+          "result": {
+            "focused": true
+          }
+        }
+      },
+      {
+        "name": "bind-server-ok",
+        "value": {
+          "method": "window.bindServer",
+          "status": "ok",
+          "result": {
+            "serverId": "550e8400-e29b-41d4-a716-446655440000",
+            "disposition": "focusedExisting"
+          }
+        }
+      },
+      {
+        "name": "open-server-window-ok",
+        "value": {
+          "method": "window.openServer",
+          "status": "ok",
+          "result": {
+            "serverId": "550e8400-e29b-41d4-a716-446655440001",
+            "disposition": "opened"
+          }
+        }
+      },
+      {
+        "name": "recovery-retry-ok",
+        "value": {
+          "method": "recovery.retry",
+          "status": "ok",
+          "result": {}
+        }
+      },
+      {
+        "name": "recovery-quit-ok",
+        "value": {
+          "method": "recovery.quit",
+          "status": "ok",
+          "result": {}
+        }
+      },
+      {
+        "name": "recovery-quit-error",
+        "value": {
+          "method": "recovery.quit",
+          "status": "error",
+          "error": {
+            "code": "QUIT_FAILED",
+            "message": "quit failed",
+            "retryable": false
+          }
+        }
+      },
+      {
+        "name": "set-server-title-ok",
+        "value": {
+          "method": "window.setServerTitle",
+          "status": "ok",
+          "result": {}
+        }
+      },
+      {
+        "name": "set-server-title-error",
+        "value": {
+          "method": "window.setServerTitle",
+          "status": "error",
+          "error": {
+            "code": "STALE_DOCUMENT",
+            "message": "document was replaced",
+            "retryable": false
+          }
+        }
+      }
+    ],
+    "invalid": [
+      {
+        "name": "bind-server-opened-disposition",
+        "value": {
+          "method": "window.bindServer",
+          "status": "ok",
+          "result": {
+            "serverId": "550e8400-e29b-41d4-a716-446655440000",
+            "disposition": "opened"
+          }
+        }
+      },
+      {
+        "name": "open-server-bound-disposition",
+        "value": {
+          "method": "window.openServer",
+          "status": "ok",
+          "result": {
+            "serverId": "550e8400-e29b-41d4-a716-446655440001",
+            "disposition": "bound"
+          }
+        }
+      },
+      {
+        "name": "unknown-response-envelope-field",
+        "value": {
+          "method": "window.focus",
+          "status": "ok",
+          "result": {
+            "focused": true
+          },
+          "extra": true
+        }
+      },
+      {
+        "name": "unknown-result-field",
+        "value": {
+          "method": "desktop.handshake",
+          "status": "ok",
+          "result": {
+            "compatibilityState": "readyFull",
+            "documentGeneration": 7,
+            "extra": true
+          }
+        }
+      },
+      {
+        "name": "blocked-is-not-an-ok-handshake",
+        "value": {
+          "method": "desktop.handshake",
+          "status": "ok",
+          "result": {
+            "compatibilityState": "blocked",
+            "documentGeneration": 7
+          }
+        }
+      },
+      {
+        "name": "unknown-error-body-field",
+        "value": {
+          "method": "window.focus",
+          "status": "error",
+          "error": {
+            "code": "FOCUS_FAILED",
+            "message": "focus failed",
+            "retryable": true,
+            "extra": true
+          }
+        }
+      },
+      {
+        "name": "response-method-result-mismatch",
+        "value": {
+          "method": "recovery.retry",
+          "status": "ok",
+          "result": {
+            "focused": true
+          }
+        }
+      },
+      {
+        "name": "set-server-title-unknown-result-field",
+        "value": {
+          "method": "window.setServerTitle",
+          "status": "ok",
+          "result": {
+            "title": "Raft"
+          }
+        }
+      }
+    ]
+  }
+}

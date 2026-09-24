@@ -1,0 +1,2539 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-09-06T16:41:57.319Z",
+  "sourceCommit": "4af93ff026213eab9a127857143989dedfeafe8f",
+  "nodeVersion": "v24.15.0",
+  "shardCount": 7,
+  "totalFiles": 495,
+  "totalDurationMsLocal": 2692322,
+  "maxFileDurationMsLocal": 130229,
+  "calibration": {
+    "baselineStatus": "present",
+    "status": "degraded",
+    "medianRatio": 0.5082879919018094,
+    "n": 255,
+    "overlap": 0.9616161616161616,
+    "baselineSourceCommit": "2cb502d294c7d4f8c89af4ce8e3fee72bfb914b9"
+  },
+  "fileTimings": [
+    {
+      "file": "src/routes/internalAgentApi.auth.test.ts",
+      "durationMs": 130229
+    },
+    {
+      "file": "src/routes/servers.api.test.ts",
+      "durationMs": 80346
+    },
+    {
+      "file": "src/routes/internal.channelMembership.api.test.ts",
+      "durationMs": 74112
+    },
+    {
+      "file": "src/routes/messages.api.test.ts",
+      "durationMs": 63935
+    },
+    {
+      "file": "src/routes/internalAgentApi.send.test.ts",
+      "durationMs": 51094
+    },
+    {
+      "file": "src/routes/agents.api.test.ts",
+      "durationMs": 48084
+    },
+    {
+      "file": "src/test/integration/lifecycle.contract.test.ts",
+      "durationMs": 44831
+    },
+    {
+      "file": "src/routes/auth.api.test.ts",
+      "durationMs": 42813
+    },
+    {
+      "file": "src/routes/channels.threads.api.test.ts",
+      "durationMs": 40178
+    },
+    {
+      "file": "src/routes/internalComputer.agentMigration.test.ts",
+      "durationMs": 39396
+    },
+    {
+      "file": "src/routes/channels.inbox.api.test.ts",
+      "durationMs": 38728
+    },
+    {
+      "file": "src/routes/internal.attestedSend.api.test.ts",
+      "durationMs": 36262
+    },
+    {
+      "file": "src/routes/internalAgentKnowledge.api.test.ts",
+      "durationMs": 32747
+    },
+    {
+      "file": "src/routes/channels.api.test.ts",
+      "durationMs": 31093
+    },
+    {
+      "file": "src/routes/oauth.api.test.ts",
+      "durationMs": 30297
+    },
+    {
+      "file": "src/services/readMutationSequencer.test.ts",
+      "durationMs": 27900
+    },
+    {
+      "file": "src/routes/channels.joint.api.test.ts",
+      "durationMs": 26562
+    },
+    {
+      "file": "src/routes/attachments.api.test.ts",
+      "durationMs": 26528
+    },
+    {
+      "file": "src/services/computerOutageNotificationService.test.ts",
+      "durationMs": 25682
+    },
+    {
+      "file": "src/services/externalInboundWorkerService.test.ts",
+      "durationMs": 25497
+    },
+    {
+      "file": "src/services/messageService.test.ts",
+      "durationMs": 25007
+    },
+    {
+      "file": "src/services/attachmentObjectBackfillService.test.ts",
+      "durationMs": 25001
+    },
+    {
+      "file": "src/services/externalDeliveryWorkerService.test.ts",
+      "durationMs": 24124
+    },
+    {
+      "file": "src/services/externalAttachmentTransferService.test.ts",
+      "durationMs": 23869
+    },
+    {
+      "file": "src/routes/channels.membership.api.test.ts",
+      "durationMs": 23372
+    },
+    {
+      "file": "src/services/billingStripe.test.ts",
+      "durationMs": 23078
+    },
+    {
+      "file": "src/services/agentMigrationService.test.ts",
+      "durationMs": 22539
+    },
+    {
+      "file": "src/services/externalAvatarMaterializerService.test.ts",
+      "durationMs": 22217
+    },
+    {
+      "file": "src/services/attachmentLifecycleService.test.ts",
+      "durationMs": 20559
+    },
+    {
+      "file": "src/routes/tasks.assignee.api.test.ts",
+      "durationMs": 19856
+    },
+    {
+      "file": "src/routes/computerAdopt.api.test.ts",
+      "durationMs": 19693
+    },
+    {
+      "file": "src/services/oauthClientRotateSecret.api.test.ts",
+      "durationMs": 18227
+    },
+    {
+      "file": "src/services/externalDeliveryOutboxService.test.ts",
+      "durationMs": 18182
+    },
+    {
+      "file": "src/services/attachmentProjectionWriterService.test.ts",
+      "durationMs": 18121
+    },
+    {
+      "file": "src/services/featureFlagService.test.ts",
+      "durationMs": 18072
+    },
+    {
+      "file": "src/services/messageMentions.contract.test.ts",
+      "durationMs": 17249
+    },
+    {
+      "file": "src/routes/slackBridge.api.test.ts",
+      "durationMs": 17116
+    },
+    {
+      "file": "src/services/rapSyscalls.sourceContract.test.ts",
+      "durationMs": 16872
+    },
+    {
+      "file": "src/routes/internal.reminders.api.test.ts",
+      "durationMs": 16630
+    },
+    {
+      "file": "src/routes/internalAgentApi.wakeHintStream.test.ts",
+      "durationMs": 16114
+    },
+    {
+      "file": "src/routes/messageTranslations.api.test.ts",
+      "durationMs": 16112
+    },
+    {
+      "file": "src/routes/internalAgentApi.cursorRebuild.test.ts",
+      "durationMs": 16089
+    },
+    {
+      "file": "src/routes/wiki.api.test.ts",
+      "durationMs": 15853
+    },
+    {
+      "file": "src/routes/attachmentComments.api.test.ts",
+      "durationMs": 15685
+    },
+    {
+      "file": "src/services/attachmentArtifactInventoryService.test.ts",
+      "durationMs": 15302
+    },
+    {
+      "file": "src/routes/integrations.api.test.ts",
+      "durationMs": 15175
+    },
+    {
+      "file": "src/routes/actions.privateAccess.api.test.ts",
+      "durationMs": 15057
+    },
+    {
+      "file": "src/services/agentMigrationReceiptService.test.ts",
+      "durationMs": 14966
+    },
+    {
+      "file": "src/routes/tasks.jointSurface.api.test.ts",
+      "durationMs": 14604
+    },
+    {
+      "file": "src/routes/internalAgentApi.mentionActions.test.ts",
+      "durationMs": 14530
+    },
+    {
+      "file": "src/routes/computerAttach.api.test.ts",
+      "durationMs": 14092
+    },
+    {
+      "file": "src/test/slackBridgeOutboundBatchMatrix.test.ts",
+      "durationMs": 14018
+    },
+    {
+      "file": "src/services/bornReadSelfCaused.test.ts",
+      "durationMs": 13783
+    },
+    {
+      "file": "src/services/externalAppIngressService.test.ts",
+      "durationMs": 13779
+    },
+    {
+      "file": "src/routes/internal.profile.api.test.ts",
+      "durationMs": 13778
+    },
+    {
+      "file": "src/services/rapAppConfigService.test.ts",
+      "durationMs": 13216
+    },
+    {
+      "file": "src/routes/deviceAuth.api.test.ts",
+      "durationMs": 12734
+    },
+    {
+      "file": "src/services/rapSyscalls.test.ts",
+      "durationMs": 12545
+    },
+    {
+      "file": "src/services/slackBridgeLocalRealAuthority.test.ts",
+      "durationMs": 12370
+    },
+    {
+      "file": "src/services/attachmentTransferIntentService.test.ts",
+      "durationMs": 12310
+    },
+    {
+      "file": "src/routes/channels.archive.api.test.ts",
+      "durationMs": 11951
+    },
+    {
+      "file": "src/services/externalReactionWorkerService.test.ts",
+      "durationMs": 11771
+    },
+    {
+      "file": "src/services/externalAppControlPlaneService.test.ts",
+      "durationMs": 11455
+    },
+    {
+      "file": "src/routes/notifications.api.test.ts",
+      "durationMs": 11427
+    },
+    {
+      "file": "src/routes/internal.scopeAttestation.api.test.ts",
+      "durationMs": 11404
+    },
+    {
+      "file": "src/services/pushService.test.ts",
+      "durationMs": 11362
+    },
+    {
+      "file": "src/routes/computerLegacyMachines.api.test.ts",
+      "durationMs": 11273
+    },
+    {
+      "file": "src/services/rapRegistryStore.test.ts",
+      "durationMs": 11160
+    },
+    {
+      "file": "src/services/taskService.claim.test.ts",
+      "durationMs": 10714
+    },
+    {
+      "file": "src/services/serverSetupReset.test.ts",
+      "durationMs": 10525
+    },
+    {
+      "file": "src/routes/announcements.api.test.ts",
+      "durationMs": 10326
+    },
+    {
+      "file": "src/routes/internal.search.api.test.ts",
+      "durationMs": 10212
+    },
+    {
+      "file": "src/services/externalReactionSyncService.test.ts",
+      "durationMs": 10211
+    },
+    {
+      "file": "src/routes/productFeedback.api.test.ts",
+      "durationMs": 10207
+    },
+    {
+      "file": "src/services/providerConnectionService.test.ts",
+      "durationMs": 10167
+    },
+    {
+      "file": "src/services/managedMcpService.test.ts",
+      "durationMs": 10087
+    },
+    {
+      "file": "src/routes/attachmentUploadSessions.api.test.ts",
+      "durationMs": 9937
+    },
+    {
+      "file": "src/services/doneFrontierGuard.pg.test.ts",
+      "durationMs": 9927
+    },
+    {
+      "file": "src/services/newsletterService.test.ts",
+      "durationMs": 9899
+    },
+    {
+      "file": "src/apps/reminder/service.contract.test.ts",
+      "durationMs": 9780
+    },
+    {
+      "file": "src/services/billingEntitlements.test.ts",
+      "durationMs": 9680
+    },
+    {
+      "file": "src/services/mentionDeliveryOccurrenceService.test.ts",
+      "durationMs": 9668
+    },
+    {
+      "file": "src/services/agentRuntimeProfileService.test.ts",
+      "durationMs": 9471
+    },
+    {
+      "file": "src/routes/workflows.api.test.ts",
+      "durationMs": 9451
+    },
+    {
+      "file": "src/services/externalOutboundAttachmentCoordinator.test.ts",
+      "durationMs": 9403
+    },
+    {
+      "file": "src/services/attachmentUploadSessionService.test.ts",
+      "durationMs": 9314
+    },
+    {
+      "file": "src/routes/readMutations.api.test.ts",
+      "durationMs": 9255
+    },
+    {
+      "file": "src/routes/internal.test.ts",
+      "durationMs": 9245
+    },
+    {
+      "file": "src/services/externalInboundAttachmentStorageService.test.ts",
+      "durationMs": 9115
+    },
+    {
+      "file": "src/routes/internalComputer.runners.test.ts",
+      "durationMs": 8972
+    },
+    {
+      "file": "src/services/channelConversionService.test.ts",
+      "durationMs": 8953
+    },
+    {
+      "file": "src/services/taskService.mixedSource.test.ts",
+      "durationMs": 8912
+    },
+    {
+      "file": "src/services/agentService.status.test.ts",
+      "durationMs": 8783
+    },
+    {
+      "file": "src/services/agentOrchestrator.deterministic.test.ts",
+      "durationMs": 8598
+    },
+    {
+      "file": "src/services/slackAudienceRefreshService.test.ts",
+      "durationMs": 8550
+    },
+    {
+      "file": "src/services/attachmentLinkingService.test.ts",
+      "durationMs": 8432
+    },
+    {
+      "file": "src/services/managedMcpOAuthService.test.ts",
+      "durationMs": 8368
+    },
+    {
+      "file": "src/routes/serverAgreements.api.test.ts",
+      "durationMs": 8261
+    },
+    {
+      "file": "src/services/computerMobileAppEmailJourneyService.test.ts",
+      "durationMs": 8183
+    },
+    {
+      "file": "src/routes/tasks.serverPagination.api.test.ts",
+      "durationMs": 8155
+    },
+    {
+      "file": "src/routes/shareArtifacts.api.test.ts",
+      "durationMs": 8116
+    },
+    {
+      "file": "src/routes/channelAdmin.api.test.ts",
+      "durationMs": 7961
+    },
+    {
+      "file": "src/services/slackBridgeInstallGrantService.test.ts",
+      "durationMs": 7947
+    },
+    {
+      "file": "src/routes/agentCredentials.api.test.ts",
+      "durationMs": 7912
+    },
+    {
+      "file": "src/apps/reminder/recurrenceSlotAnchor.contract.test.ts",
+      "durationMs": 7611
+    },
+    {
+      "file": "src/services/inboxPolicyModel.test.ts",
+      "durationMs": 7576
+    },
+    {
+      "file": "src/services/slackBridgeServerRuntime.test.ts",
+      "durationMs": 7570
+    },
+    {
+      "file": "src/services/promotedOwnerSetupReconcile.test.ts",
+      "durationMs": 7449
+    },
+    {
+      "file": "src/routes/timezoneObservation.api.test.ts",
+      "durationMs": 7421
+    },
+    {
+      "file": "src/routes/guestRbac.api.test.ts",
+      "durationMs": 7412
+    },
+    {
+      "file": "src/routes/internalComputer.agentO11y.api.test.ts",
+      "durationMs": 7339
+    },
+    {
+      "file": "src/routes/channels.getJoined.api.test.ts",
+      "durationMs": 7250
+    },
+    {
+      "file": "src/routes/channels.joinCapability.api.test.ts",
+      "durationMs": 7238
+    },
+    {
+      "file": "src/services/taskService.allShapesOperations.test.ts",
+      "durationMs": 7121
+    },
+    {
+      "file": "src/routes/internalAgentApi.attachmentComments.test.ts",
+      "durationMs": 7046
+    },
+    {
+      "file": "src/services/channelService.dmLock.test.ts",
+      "durationMs": 7028
+    },
+    {
+      "file": "src/routes/tasks.orphanCleanup.api.test.ts",
+      "durationMs": 7015
+    },
+    {
+      "file": "src/services/slackBridgeDatabaseRuntimeAuthority.test.ts",
+      "durationMs": 6932
+    },
+    {
+      "file": "src/services/slackBridgeProductionComposition.test.ts",
+      "durationMs": 6513
+    },
+    {
+      "file": "src/routes/attachmentPreviewBridge.api.test.ts",
+      "durationMs": 6445
+    },
+    {
+      "file": "src/services/agentOrchestrator.legacyReminderFireAttempt.test.ts",
+      "durationMs": 6439
+    },
+    {
+      "file": "src/db/attachmentProjectionFoundationMigration.test.ts",
+      "durationMs": 6414
+    },
+    {
+      "file": "src/routes/internalAgentApi.crossReplicaWake.test.ts",
+      "durationMs": 6291
+    },
+    {
+      "file": "src/routes/internalAgentApi.appConfig.test.ts",
+      "durationMs": 6286
+    },
+    {
+      "file": "src/routes/servers.joinCommunity.api.test.ts",
+      "durationMs": 6279
+    },
+    {
+      "file": "src/routes/tasks.shapeSurfaces.api.test.ts",
+      "durationMs": 6261
+    },
+    {
+      "file": "src/services/externalProjectionService.test.ts",
+      "durationMs": 6222
+    },
+    {
+      "file": "src/test/slackBridgeFullFlowHarness.test.ts",
+      "durationMs": 6003
+    },
+    {
+      "file": "src/routes/servers.transcriptFeedback.api.test.ts",
+      "durationMs": 5751
+    },
+    {
+      "file": "src/routes/internalComputer.preflight.test.ts",
+      "durationMs": 5732
+    },
+    {
+      "file": "src/routes/channels.membersBatch.api.test.ts",
+      "durationMs": 5637
+    },
+    {
+      "file": "src/routes/messagesThreadSummaries.api.test.ts",
+      "durationMs": 5589
+    },
+    {
+      "file": "src/routes/tasks.channelMembership.api.test.ts",
+      "durationMs": 5547
+    },
+    {
+      "file": "src/services/fileUploadQuotaService.test.ts",
+      "durationMs": 5522
+    },
+    {
+      "file": "src/services/principalHandleUniqueness.test.ts",
+      "durationMs": 5460
+    },
+    {
+      "file": "src/services/channelService.allMembership.test.ts",
+      "durationMs": 5372
+    },
+    {
+      "file": "src/services/appNotificationDeliveryService.test.ts",
+      "durationMs": 5331
+    },
+    {
+      "file": "src/services/agentService.batchEnrich.test.ts",
+      "durationMs": 5307
+    },
+    {
+      "file": "src/routes/agentDiscovery.api.test.ts",
+      "durationMs": 5271
+    },
+    {
+      "file": "src/services/onboardingEmailJourneyService.test.ts",
+      "durationMs": 5216
+    },
+    {
+      "file": "src/routes/push.api.test.ts",
+      "durationMs": 5183
+    },
+    {
+      "file": "src/services/serverSetupStateService.test.ts",
+      "durationMs": 5155
+    },
+    {
+      "file": "src/services/messageService.threadJoinContext.test.ts",
+      "durationMs": 5149
+    },
+    {
+      "file": "src/services/announcementOldestFirst.test.ts",
+      "durationMs": 5118
+    },
+    {
+      "file": "src/services/attachmentAuthorityService.test.ts",
+      "durationMs": 5066
+    },
+    {
+      "file": "src/services/slackBridgeLocalRuntime.test.ts",
+      "durationMs": 5013
+    },
+    {
+      "file": "src/services/activitySyncPairing.endpoint.test.ts",
+      "durationMs": 5005
+    },
+    {
+      "file": "src/services/inboxNotificationService.test.ts",
+      "durationMs": 4953
+    },
+    {
+      "file": "src/routes/internalAgentApi.threadRead.test.ts",
+      "durationMs": 4927
+    },
+    {
+      "file": "src/services/agentMigrationLegacyRepairService.test.ts",
+      "durationMs": 4926
+    },
+    {
+      "file": "src/services/onboardingBriefingOnActivation.test.ts",
+      "durationMs": 4863
+    },
+    {
+      "file": "src/services/storageOrphanCleanupService.test.ts",
+      "durationMs": 4853
+    },
+    {
+      "file": "src/services/activitySyncService.test.ts",
+      "durationMs": 4844
+    },
+    {
+      "file": "src/routes/mobileDownload.test.ts",
+      "durationMs": 4777
+    },
+    {
+      "file": "src/services/persistedMessageFactEmission.test.ts",
+      "durationMs": 4774
+    },
+    {
+      "file": "src/services/rapBuiltinAppCriteria.test.ts",
+      "durationMs": 4739
+    },
+    {
+      "file": "src/routes/billing.api.test.ts",
+      "durationMs": 4681
+    },
+    {
+      "file": "src/services/reminderRecurring.contract.test.ts",
+      "durationMs": 4613
+    },
+    {
+      "file": "src/services/agentPermalinkRenderService.test.ts",
+      "durationMs": 4608
+    },
+    {
+      "file": "src/routes/internal.runtimeProfile.api.test.ts",
+      "durationMs": 4599
+    },
+    {
+      "file": "src/services/agentScopesService.test.ts",
+      "durationMs": 4594
+    },
+    {
+      "file": "src/services/taskService.amend.test.ts",
+      "durationMs": 4569
+    },
+    {
+      "file": "src/routes/serverLabs.api.test.ts",
+      "durationMs": 4559
+    },
+    {
+      "file": "src/routes/tasks.realtimeProjection.api.test.ts",
+      "durationMs": 4559
+    },
+    {
+      "file": "src/services/agentService.secondAgentEvent.test.ts",
+      "durationMs": 4553
+    },
+    {
+      "file": "src/routes/internalAgentApi.feedbackLocator.test.ts",
+      "durationMs": 4545
+    },
+    {
+      "file": "src/test/integration/database.contract.test.ts",
+      "durationMs": 4527
+    },
+    {
+      "file": "src/services/inviteService.emailNormalization.test.ts",
+      "durationMs": 4512
+    },
+    {
+      "file": "src/appFallback.api.test.ts",
+      "durationMs": 4473
+    },
+    {
+      "file": "src/db/onboardingSetupBackfill.test.ts",
+      "durationMs": 4445
+    },
+    {
+      "file": "src/services/activityUnreadTotalsBatch.oracle.test.ts",
+      "durationMs": 4445
+    },
+    {
+      "file": "src/routes/reminders.api.test.ts",
+      "durationMs": 4306
+    },
+    {
+      "file": "src/services/reminderCancel.contract.test.ts",
+      "durationMs": 4259
+    },
+    {
+      "file": "src/routes/errorHygieneBlackbox.api.test.ts",
+      "durationMs": 4228
+    },
+    {
+      "file": "src/services/productFeedbackLocatorService.test.ts",
+      "durationMs": 4184
+    },
+    {
+      "file": "src/routes/internalAgentApi.migration.test.ts",
+      "durationMs": 4179
+    },
+    {
+      "file": "src/db/deferRemovalBackfill.test.ts",
+      "durationMs": 4110
+    },
+    {
+      "file": "src/db/migrateDeploy.test.ts",
+      "durationMs": 4063
+    },
+    {
+      "file": "src/routes/systemNotifications.api.test.ts",
+      "durationMs": 4038
+    },
+    {
+      "file": "src/routes/channelFiles.api.test.ts",
+      "durationMs": 4032
+    },
+    {
+      "file": "src/routes/servers.mentionRedriveAuthz.api.test.ts",
+      "durationMs": 4017
+    },
+    {
+      "file": "src/services/computerLifecycleOperationService.test.ts",
+      "durationMs": 4017
+    },
+    {
+      "file": "src/services/agentOrchestrator.mentionRedriveDelivery.test.ts",
+      "durationMs": 3993
+    },
+    {
+      "file": "src/routes/internalAgentApi.mcp.test.ts",
+      "durationMs": 3986
+    },
+    {
+      "file": "src/routes/authIdentityUnlink.api.test.ts",
+      "durationMs": 3962
+    },
+    {
+      "file": "src/routes/managedMcp.api.test.ts",
+      "durationMs": 3962
+    },
+    {
+      "file": "src/services/agentOrchestrator.mentionIdentityFallback.test.ts",
+      "durationMs": 3935
+    },
+    {
+      "file": "src/routes/servers.activityUnreadSummary.api.test.ts",
+      "durationMs": 3929
+    },
+    {
+      "file": "src/routes/externalProjectionReactionRoutes.test.ts",
+      "durationMs": 3852
+    },
+    {
+      "file": "src/services/seqHeadroomTripwire.health.test.ts",
+      "durationMs": 3811
+    },
+    {
+      "file": "src/services/planService.test.ts",
+      "durationMs": 3776
+    },
+    {
+      "file": "src/routes/authRefreshAttemptRoute.test.ts",
+      "durationMs": 3771
+    },
+    {
+      "file": "src/services/inboxPolicyModel.readState.test.ts",
+      "durationMs": 3718
+    },
+    {
+      "file": "src/services/attachmentProjectionRevocationService.test.ts",
+      "durationMs": 3696
+    },
+    {
+      "file": "src/services/userService.onboardingEmailJourney.test.ts",
+      "durationMs": 3680
+    },
+    {
+      "file": "src/services/appConfigTransportComposition.test.ts",
+      "durationMs": 3642
+    },
+    {
+      "file": "src/services/channelService.messageStorageScope.test.ts",
+      "durationMs": 3587
+    },
+    {
+      "file": "src/routes/internal.agentScope.api.test.ts",
+      "durationMs": 3526
+    },
+    {
+      "file": "src/routes/productEvents.api.test.ts",
+      "durationMs": 3494
+    },
+    {
+      "file": "src/services/agentActivityLogService.test.ts",
+      "durationMs": 3476
+    },
+    {
+      "file": "src/services/agentOrchestrator.reminderRefusalLog.test.ts",
+      "durationMs": 3462
+    },
+    {
+      "file": "src/services/agentOrchestrator.appRuntimeTrace.test.ts",
+      "durationMs": 3430
+    },
+    {
+      "file": "src/routes/oidc.api.test.ts",
+      "durationMs": 3416
+    },
+    {
+      "file": "src/services/attachmentUploadWriterService.test.ts",
+      "durationMs": 3415
+    },
+    {
+      "file": "src/services/taskService.resourceReceipt.test.ts",
+      "durationMs": 3397
+    },
+    {
+      "file": "src/services/reminderArmWatchdogFairness.contract.test.ts",
+      "durationMs": 3375
+    },
+    {
+      "file": "src/routes/providerConnections.api.test.ts",
+      "durationMs": 3371
+    },
+    {
+      "file": "src/services/featureFlagRolloutWriterService.test.ts",
+      "durationMs": 3369
+    },
+    {
+      "file": "src/routes/agents.credentials.gate.test.ts",
+      "durationMs": 3316
+    },
+    {
+      "file": "src/routes/internalAgentApi.eventsSenderType.test.ts",
+      "durationMs": 3298
+    },
+    {
+      "file": "src/routes/servers.scopeAttestation.api.test.ts",
+      "durationMs": 3282
+    },
+    {
+      "file": "src/services/agentSendReplayService.test.ts",
+      "durationMs": 3258
+    },
+    {
+      "file": "src/services/devSeedOnboardingState.test.ts",
+      "durationMs": 3232
+    },
+    {
+      "file": "src/services/unreadSummaryReadState.test.ts",
+      "durationMs": 3224
+    },
+    {
+      "file": "src/services/userService.usernameUniqueness.test.ts",
+      "durationMs": 3198
+    },
+    {
+      "file": "src/routes/identitySetup.api.test.ts",
+      "durationMs": 3185
+    },
+    {
+      "file": "src/services/taskService.creatorMembership.test.ts",
+      "durationMs": 3130
+    },
+    {
+      "file": "src/routes/agentLogin.gate.test.ts",
+      "durationMs": 3114
+    },
+    {
+      "file": "src/services/serverLabReadConsistency.test.ts",
+      "durationMs": 3102
+    },
+    {
+      "file": "src/services/reminderArmWatchdog.contract.test.ts",
+      "durationMs": 3084
+    },
+    {
+      "file": "src/services/agentOrchestrator.appRuntimeTrace.e2e.test.ts",
+      "durationMs": 3072
+    },
+    {
+      "file": "src/routes/featureFlags.api.test.ts",
+      "durationMs": 3070
+    },
+    {
+      "file": "src/routes/featureFlagOperatorPreview.api.test.ts",
+      "durationMs": 3061
+    },
+    {
+      "file": "src/apps/reminder/crud.test.ts",
+      "durationMs": 3058
+    },
+    {
+      "file": "src/routes/featureFlagsAdmin.removed.api.test.ts",
+      "durationMs": 3048
+    },
+    {
+      "file": "src/lib/actorPermissions.test.ts",
+      "durationMs": 3013
+    },
+    {
+      "file": "src/routes/internalAgentApi.killSwitch.test.ts",
+      "durationMs": 3010
+    },
+    {
+      "file": "src/db/slackBridgeOutboxSchema.test.ts",
+      "durationMs": 2982
+    },
+    {
+      "file": "src/middleware/perfAttribution.test.ts",
+      "durationMs": 2975
+    },
+    {
+      "file": "src/services/agentOrchestrator.reminderArmRejected.test.ts",
+      "durationMs": 2940
+    },
+    {
+      "file": "src/services/externalConversationTargetService.test.ts",
+      "durationMs": 2933
+    },
+    {
+      "file": "src/routes/version.api.test.ts",
+      "durationMs": 2907
+    },
+    {
+      "file": "src/services/actionCardsMigration.test.ts",
+      "durationMs": 2837
+    },
+    {
+      "file": "src/services/productFeedbackRouting.integration.test.ts",
+      "durationMs": 2763
+    },
+    {
+      "file": "src/services/machineService.computerVersion.test.ts",
+      "durationMs": 2759
+    },
+    {
+      "file": "src/routes/daemon.wsAuth.test.ts",
+      "durationMs": 2697
+    },
+    {
+      "file": "src/config/attachmentDirectUpload.test.ts",
+      "durationMs": 2653
+    },
+    {
+      "file": "src/services/agentMigrationRealtime.test.ts",
+      "durationMs": 2641
+    },
+    {
+      "file": "src/services/inboxMutePolicy.test.ts",
+      "durationMs": 2580
+    },
+    {
+      "file": "src/services/serverService.announcementGate.test.ts",
+      "durationMs": 2548
+    },
+    {
+      "file": "src/db/slackBridgeMigrationChain.test.ts",
+      "durationMs": 2522
+    },
+    {
+      "file": "src/routes/serverSetupGate.daemonReady.test.ts",
+      "durationMs": 2506
+    },
+    {
+      "file": "src/routes/appAdmin.removed.api.test.ts",
+      "durationMs": 2502
+    },
+    {
+      "file": "src/db/pgliteMigrations.test.ts",
+      "durationMs": 2409
+    },
+    {
+      "file": "src/db/productFeedbackProjectionRemovalMigration.test.ts",
+      "durationMs": 2348
+    },
+    {
+      "file": "src/db/computerLifecycleDispatchMigration.test.ts",
+      "durationMs": 2335
+    },
+    {
+      "file": "src/services/userService.emailNormalization.test.ts",
+      "durationMs": 2235
+    },
+    {
+      "file": "src/db/featureFlagAudienceMigration.test.ts",
+      "durationMs": 2226
+    },
+    {
+      "file": "src/db/wikiBindingsMigration.test.ts",
+      "durationMs": 2201
+    },
+    {
+      "file": "src/db/attachmentTransferIntentMigration.test.ts",
+      "durationMs": 2200
+    },
+    {
+      "file": "src/db/timezoneObservationMigration.test.ts",
+      "durationMs": 2187
+    },
+    {
+      "file": "src/db/attachmentArtifactInventoryMigration.test.ts",
+      "durationMs": 2060
+    },
+    {
+      "file": "src/db/slackBridgeControlPlaneMigration.test.ts",
+      "durationMs": 1984
+    },
+    {
+      "file": "src/db/announcementLifecycleMigration.test.ts",
+      "durationMs": 1916
+    },
+    {
+      "file": "src/db/attachmentMessagePositionMigration.test.ts",
+      "durationMs": 1752
+    },
+    {
+      "file": "src/db/agentKnowledgeTelemetryMigration.test.ts",
+      "durationMs": 1582
+    },
+    {
+      "file": "src/services/agentKnowledgeService.searchFuzzy.test.ts",
+      "durationMs": 1473
+    },
+    {
+      "file": "src/db/dmChannelIdentityMigration.test.ts",
+      "durationMs": 1435
+    },
+    {
+      "file": "src/db/inboxAutoanalyzeMigration.test.ts",
+      "durationMs": 1421
+    },
+    {
+      "file": "src/db/awsMigrationTimeoutContract.test.ts",
+      "durationMs": 778
+    },
+    {
+      "file": "src/services/channelService.risingwaveFailsoft.test.ts",
+      "durationMs": 662
+    },
+    {
+      "file": "src/db/migrationPreflight.test.ts",
+      "durationMs": 630
+    },
+    {
+      "file": "src/services/agentKnowledgeService.searchExactMatch.test.ts",
+      "durationMs": 521
+    },
+    {
+      "file": "src/runServerShardWithWatchdog.test.ts",
+      "durationMs": 336
+    },
+    {
+      "file": "src/services/scopeDbSdkUsage.contract.test.ts",
+      "durationMs": 271
+    },
+    {
+      "file": "src/services/agentKnowledgeService.retrievalPath.test.ts",
+      "durationMs": 245
+    },
+    {
+      "file": "src/services/searchService.test.ts",
+      "durationMs": 186
+    },
+    {
+      "file": "src/routes/attachments.test.ts",
+      "durationMs": 126
+    },
+    {
+      "file": "src/services/agentKnowledgeService.discovery.test.ts",
+      "durationMs": 101
+    },
+    {
+      "file": "src/services/messageRealtimeEvents.test.ts",
+      "durationMs": 89
+    },
+    {
+      "file": "src/services/socialAuthService.test.ts",
+      "durationMs": 86
+    },
+    {
+      "file": "src/lib/actorPermissions.boundary.test.ts",
+      "durationMs": 76
+    },
+    {
+      "file": "src/services/externalAgentNotificationSender.removal.contract.test.ts",
+      "durationMs": 76
+    },
+    {
+      "file": "src/routes/agentMigrationErrors.contract.test.ts",
+      "durationMs": 48
+    },
+    {
+      "file": "src/services/ordinaryMessageExternalProjection.test.ts",
+      "durationMs": 47
+    },
+    {
+      "file": "src/services/devSeedAgentMembership.test.ts",
+      "durationMs": 40
+    },
+    {
+      "file": "src/services/translation/providers/google.test.ts",
+      "durationMs": 37
+    },
+    {
+      "file": "src/services/agentKnowledgeService.aliases.test.ts",
+      "durationMs": 35
+    },
+    {
+      "file": "src/db/migrationTimeoutContract.test.ts",
+      "durationMs": 34
+    },
+    {
+      "file": "src/routes/errorResponse.test.ts",
+      "durationMs": 33
+    },
+    {
+      "file": "src/services/agentKnowledgeService.mention.test.ts",
+      "durationMs": 32
+    },
+    {
+      "file": "src/services/slackProviderAdapter.test.ts",
+      "durationMs": 32
+    },
+    {
+      "file": "src/services/pushDisplay.test.ts",
+      "durationMs": 28
+    },
+    {
+      "file": "src/services/wikiManifestService.test.ts",
+      "durationMs": 28
+    },
+    {
+      "file": "src/machineLocalReplay.test.ts",
+      "durationMs": 25
+    },
+    {
+      "file": "src/services/productFeedbackConversationService.test.ts",
+      "durationMs": 24
+    },
+    {
+      "file": "src/services/storageService.test.ts",
+      "durationMs": 22
+    },
+    {
+      "file": "src/services/inboxRouteBackpressure.test.ts",
+      "durationMs": 21
+    },
+    {
+      "file": "src/services/externalProjectionAuthority.contract.test.ts",
+      "durationMs": 20
+    },
+    {
+      "file": "src/services/onboardingService.test.ts",
+      "durationMs": 19
+    },
+    {
+      "file": "src/services/slackBridgeProductionAppContract.test.ts",
+      "durationMs": 19
+    },
+    {
+      "file": "src/services/runtimeFormDefinitionService.test.ts",
+      "durationMs": 17
+    },
+    {
+      "file": "src/db/awsTerraformPlanSafetyContract.test.ts",
+      "durationMs": 16
+    },
+    {
+      "file": "src/services/taskRealtimeEvents.test.ts",
+      "durationMs": 16
+    },
+    {
+      "file": "src/tracing/scopeDbTraceEventSink.test.ts",
+      "durationMs": 16
+    },
+    {
+      "file": "src/services/agentLifecycleReducer.shadow.test.ts",
+      "durationMs": 15
+    },
+    {
+      "file": "src/db/messageRandomIdIndexContract.test.ts",
+      "durationMs": 14
+    },
+    {
+      "file": "src/services/agentKnowledgeService.runtimeSkills.test.ts",
+      "durationMs": 14
+    },
+    {
+      "file": "src/db/messagesSenderIndexContract.test.ts",
+      "durationMs": 13
+    },
+    {
+      "file": "src/services/agentDaemonReleaseNotes.test.ts",
+      "durationMs": 13
+    },
+    {
+      "file": "src/db/featureFlagAdminPrivileges.test.ts",
+      "durationMs": 11
+    },
+    {
+      "file": "src/services/inboxSuppressionWriters.contract.test.ts",
+      "durationMs": 11
+    },
+    {
+      "file": "src/services/recurrence.test.ts",
+      "durationMs": 11
+    },
+    {
+      "file": "src/services/slackBridgeManagedRuntime.test.ts",
+      "durationMs": 11
+    },
+    {
+      "file": "src/services/slackBridgeWorkerLifecycle.test.ts",
+      "durationMs": 11
+    },
+    {
+      "file": "src/services/managedMcpGateway.test.ts",
+      "durationMs": 10
+    },
+    {
+      "file": "src/middleware/profileSetupGate.contract.test.ts",
+      "durationMs": 9
+    },
+    {
+      "file": "src/services/agentKnowledgeService.membershipRbac.test.ts",
+      "durationMs": 9
+    },
+    {
+      "file": "src/services/agentLifecycleReducer.property.test.ts",
+      "durationMs": 9
+    },
+    {
+      "file": "src/services/oauthService.test.ts",
+      "durationMs": 9
+    },
+    {
+      "file": "src/services/slackBridgeEnvSecrets.test.ts",
+      "durationMs": 9
+    },
+    {
+      "file": "src/services/agentKnowledgeService.taskClaimLock.test.ts",
+      "durationMs": 8
+    },
+    {
+      "file": "src/services/appWebhookConfigService.test.ts",
+      "durationMs": 8
+    },
+    {
+      "file": "src/services/computerBroadcastPolicyService.test.ts",
+      "durationMs": 8
+    },
+    {
+      "file": "src/services/sessionService.test.ts",
+      "durationMs": 8
+    },
+    {
+      "file": "src/tracing/queryTrace.test.ts",
+      "durationMs": 8
+    },
+    {
+      "file": "src/db/index.test.ts",
+      "durationMs": 7
+    },
+    {
+      "file": "src/services/agentKnowledgeService.sendIdempotency.test.ts",
+      "durationMs": 7
+    },
+    {
+      "file": "src/services/legacyAttachmentCleanerArm.contract.test.ts",
+      "durationMs": 7
+    },
+    {
+      "file": "src/services/agentKnowledgeService.loginWithRaft.test.ts",
+      "durationMs": 6
+    },
+    {
+      "file": "src/services/agentLifecycleReducer.arbitration.test.ts",
+      "durationMs": 6
+    },
+    {
+      "file": "src/services/attachmentPreviews/documentProviders.test.ts",
+      "durationMs": 6
+    },
+    {
+      "file": "src/services/getting-started.test.ts",
+      "durationMs": 6
+    },
+    {
+      "file": "src/services/productFeedbackService.test.ts",
+      "durationMs": 6
+    },
+    {
+      "file": "src/services/runtimeAccountUsageCacheService.test.ts",
+      "durationMs": 6
+    },
+    {
+      "file": "src/services/systemNotificationService.test.ts",
+      "durationMs": 6
+    },
+    {
+      "file": "src/socket/platformScope.test.ts",
+      "durationMs": 6
+    },
+    {
+      "file": "src/db/migrationPhases.test.ts",
+      "durationMs": 5
+    },
+    {
+      "file": "src/db/repairDmDuplicateChannels.test.ts",
+      "durationMs": 5
+    },
+    {
+      "file": "src/middleware/requestObservability.test.ts",
+      "durationMs": 5
+    },
+    {
+      "file": "src/services/agentKnowledgeService.integration.test.ts",
+      "durationMs": 5
+    },
+    {
+      "file": "src/services/attachmentObjectBackfillRun.test.ts",
+      "durationMs": 5
+    },
+    {
+      "file": "src/services/attachmentPreviewBridge.test.ts",
+      "durationMs": 5
+    },
+    {
+      "file": "src/services/emailService.test.ts",
+      "durationMs": 5
+    },
+    {
+      "file": "src/services/risingWaveInboxSuppressionShape.contract.test.ts",
+      "durationMs": 5
+    },
+    {
+      "file": "src/services/translation/providers/azure.test.ts",
+      "durationMs": 5
+    },
+    {
+      "file": "src/services/translation/providers/volcengine.test.ts",
+      "durationMs": 5
+    },
+    {
+      "file": "src/version.test.ts",
+      "durationMs": 5
+    },
+    {
+      "file": "src/services/agentKnowledgeService.threadContextRule.test.ts",
+      "durationMs": 4
+    },
+    {
+      "file": "src/services/messageResourceRefs.contract.test.ts",
+      "durationMs": 4
+    },
+    {
+      "file": "src/services/rapRegistry.test.ts",
+      "durationMs": 4
+    },
+    {
+      "file": "src/services/systemMessageBornReadRegistry.test.ts",
+      "durationMs": 4
+    },
+    {
+      "file": "src/tracing/semanticTrace.test.ts",
+      "durationMs": 4
+    },
+    {
+      "file": "src/tracing/traceDeploymentIdentity.test.ts",
+      "durationMs": 4
+    },
+    {
+      "file": "src/app.rateLimit.test.ts",
+      "durationMs": 3
+    },
+    {
+      "file": "src/deployDockerfiles.contract.test.ts",
+      "durationMs": 3
+    },
+    {
+      "file": "src/replicaRouter.inboxReceipt.test.ts",
+      "durationMs": 3
+    },
+    {
+      "file": "src/services/agentKnowledgeAppTopic.test.ts",
+      "durationMs": 3
+    },
+    {
+      "file": "src/services/agentKnowledgeServedBodyLeak.test.ts",
+      "durationMs": 3
+    },
+    {
+      "file": "src/services/agentLifecycleReducer.test.ts",
+      "durationMs": 3
+    },
+    {
+      "file": "src/services/builtinModelCatalogCompatibility.test.ts",
+      "durationMs": 3
+    },
+    {
+      "file": "src/services/channelService.risingWaveTrace.contract.test.ts",
+      "durationMs": 3
+    },
+    {
+      "file": "src/services/computerVersionService.test.ts",
+      "durationMs": 3
+    },
+    {
+      "file": "src/services/productFeedbackRouteSubject.test.ts",
+      "durationMs": 3
+    },
+    {
+      "file": "src/services/slackBridgeRuntimeService.test.ts",
+      "durationMs": 3
+    },
+    {
+      "file": "src/tracing/risingWaveInboxTrace.test.ts",
+      "durationMs": 3
+    },
+    {
+      "file": "src/tracing/serverTracer.test.ts",
+      "durationMs": 3
+    },
+    {
+      "file": "src/metrics.test.ts",
+      "durationMs": 2
+    },
+    {
+      "file": "src/middleware/auth.test.ts",
+      "durationMs": 2
+    },
+    {
+      "file": "src/routes/internalAgentApi.contract.test.ts",
+      "durationMs": 2
+    },
+    {
+      "file": "src/routes/internalAgentApi.registryParity.test.ts",
+      "durationMs": 2
+    },
+    {
+      "file": "src/routes/otlpRelay.test.ts",
+      "durationMs": 2
+    },
+    {
+      "file": "src/server.slackBridgeLifecycle.contract.test.ts",
+      "durationMs": 2
+    },
+    {
+      "file": "src/services/agentKnowledgeService.integrationScope.test.ts",
+      "durationMs": 2
+    },
+    {
+      "file": "src/services/agentOrchestrator.runtimeProfileHotPath.test.ts",
+      "durationMs": 2
+    },
+    {
+      "file": "src/services/canonicalMessageManifest.producer.test.ts",
+      "durationMs": 2
+    },
+    {
+      "file": "src/services/daemonVersionService.test.ts",
+      "durationMs": 2
+    },
+    {
+      "file": "src/services/integrationAuditService.test.ts",
+      "durationMs": 2
+    },
+    {
+      "file": "src/services/legacyAgentLifecycleAdapter.runtimeError.test.ts",
+      "durationMs": 2
+    },
+    {
+      "file": "src/services/machineCatalogAuthority.test.ts",
+      "durationMs": 2
+    },
+    {
+      "file": "src/services/machineContext.test.ts",
+      "durationMs": 2
+    },
+    {
+      "file": "src/services/managedMcpCredentialService.test.ts",
+      "durationMs": 2
+    },
+    {
+      "file": "src/services/rapTimerRuntime.test.ts",
+      "durationMs": 2
+    },
+    {
+      "file": "src/services/risingWaveInboxBornReadParity.contract.test.ts",
+      "durationMs": 2
+    },
+    {
+      "file": "src/services/runtimeAdmissionService.test.ts",
+      "durationMs": 2
+    },
+    {
+      "file": "src/services/serverNotificationPreferences.test.ts",
+      "durationMs": 2
+    },
+    {
+      "file": "src/services/slackBridgeAwsIngressCrypto.test.ts",
+      "durationMs": 2
+    },
+    {
+      "file": "src/services/slackBridgeAwsSecrets.test.ts",
+      "durationMs": 2
+    },
+    {
+      "file": "src/services/slackInboundAttachmentAdapter.test.ts",
+      "durationMs": 2
+    },
+    {
+      "file": "src/tracing/otlpHttpTraceSink.test.ts",
+      "durationMs": 2
+    },
+    {
+      "file": "src/tracing/sendRouteFailure.test.ts",
+      "durationMs": 2
+    },
+    {
+      "file": "src/wikiWorkspacePack.contract.test.ts",
+      "durationMs": 2
+    },
+    {
+      "file": "src/apps/cleaner/configProjector.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/apps/cleaner/definition.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/apps/reminder/fireTiming.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/apps/reminder/protocolTransition.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/apps/reminder/service.realPg.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/config/appUrl.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/config/attachmentPreviewUnified.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/db/appOwnershipMigration.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/db/featureFlagAdminPrivileges.realPg.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/db/migrateDeploy.realPg.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/db/migrationPhases.realPg.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/db/migrationPreflight.realPg.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/db/readCursorWiden.realPg.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/db/risingwave.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/db/translationDefaultMigration.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/lib/brandedParse.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/lib/readStateDelegation.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/middleware/agentRouteScopeCoverage.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/middleware/raftdevActivity.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/routes/agentKnowledgeSearchSerialization.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/routes/authLoginTrace.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/routes/authRefreshTrace.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/routes/inboxPressure.realPg.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/routes/oauthServerinfo.contract.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/routes/oauthServerinfoDocs.contract.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/runTestShard.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/scripts/cleanupEmptyThreadChannels.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/serverShutdown.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/activitySyncService.normalizeRow.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/activitySyncService.realPg.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/activityUnreadTotalsBatch.explain.realPg.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/agentActivityCompatibility.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/agentCredentialService.capabilities.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/agentKnowledgeService.taskClosed.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/agentKnowledgeSourcePaths.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/agentKnowledgeThreadMute.contract.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/agentLifecycleEvents.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/agentMigrationLegacyRepairService.realPg.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/agentMigrationReceiptOrdering.realPg.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/agentMigrationWorkerObservability.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/agentO11yScopeDbWriter.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/agentOrchestrator.ackPlan.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/agentOrchestrator.activityBroadcastPlan.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/agentOrchestrator.activityHintPlan.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/agentOrchestrator.activityPlan.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/agentOrchestrator.launchGuardVersion.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/agentOrchestrator.lifecycleAcceptancePlan.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/agentOrchestrator.localDeliveryPlan.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/agentOrchestrator.localInboxPlan.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/agentOrchestrator.machineReachabilityPlan.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/agentOrchestrator.mentionRedrivePlan.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/agentOrchestrator.readyPlan.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/agentOrchestrator.receivePlan.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/agentOrchestrator.reminderReceiptPlan.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/agentOrchestrator.resetPlan.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/agentOrchestrator.routedOwnershipPlan.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/agentOrchestrator.runtimeModelSource.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/agentOrchestrator.runtimeProfileSource.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/agentOrchestrator.sendToMachinePlan.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/agentOrchestrator.sessionPlan.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/agentOrchestrator.staleActivityPlan.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/agentOrchestrator.staleTransientPlan.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/agentOrchestrator.statusPlan.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/agentOrchestrator.stopPlan.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/agentOrchestrator.wakePlan.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/appOutboundPermissionService.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/appOutboundProjectionService.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/attachmentCommentAnchorLabel.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/attachmentLifecycleService.realPg.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/attachmentObjectBackfillGate.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/attachmentPreviews/diffPatchProvider.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/attachmentPreviews/registry.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/channelLifecycle.realPg.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/channelService.channelRef.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/channelService.risingwavePrepare.realRw.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/channelService.serverIdGuard.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/doneFrontierGuard.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/externalAppControlPlaneService.realPg.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/externalInboundWorkerService.realPg.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/externalReactionEmojiMap.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/featureFlagRolloutWriterService.realPg.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/followedThreadFrontier.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/followedThreadStats.realPg.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/inboxPolicyModel.latestActivitySeq.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/inboxServingMentionScope.realPg.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/messageService.summarize.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/nativeNotificationService.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/onboardingService.activationPlan.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/productEventsService.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/productFeedbackTiming.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/promotedOwnerSetupRace.realPg.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/rapAppConfigService.realPg.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/rapHookEnvelopeSync.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/readMutationSequencer.realPg.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/registrationPolicy.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/reminderRapCallers.contract.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/reminderScheduleInput.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/risingWaveInboxFactVisibilityParity.contract.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/runtimeAccountUsageSchedule.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/scopeDbSdkPolicy.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/searchSenderIndex.realPg.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/seqHeadroomTripwire.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/serverSettingsService.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/slackBridgeProviderProfile.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/slackBridgeProvisioningControlPlane.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/stagingSelfAccountRetirement.realPg.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/taskService.assignment.realPg.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/taskService.transition.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/services/translation/placeholderValidator.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/socket/index.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/socket/traceMetadata.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/tracing/decisionTrace.test.ts",
+      "durationMs": 1
+    },
+    {
+      "file": "src/tracing/routeFailure.test.ts",
+      "durationMs": 1
+    }
+  ],
+  "shards": [
+    {
+      "shard": 1,
+      "expectedDurationMs": 384618,
+      "files": [
+        "src/apps/cleaner/definition.test.ts",
+        "src/config/appUrl.test.ts",
+        "src/db/attachmentMessagePositionMigration.test.ts",
+        "src/db/attachmentProjectionFoundationMigration.test.ts",
+        "src/db/deferRemovalBackfill.test.ts",
+        "src/db/featureFlagAudienceMigration.test.ts",
+        "src/db/onboardingSetupBackfill.test.ts",
+        "src/db/readCursorWiden.realPg.test.ts",
+        "src/db/slackBridgeMigrationChain.test.ts",
+        "src/lib/actorPermissions.boundary.test.ts",
+        "src/middleware/profileSetupGate.contract.test.ts",
+        "src/routes/agentKnowledgeSearchSerialization.test.ts",
+        "src/routes/attachments.test.ts",
+        "src/routes/authRefreshAttemptRoute.test.ts",
+        "src/routes/computerAdopt.api.test.ts",
+        "src/routes/computerAttach.api.test.ts",
+        "src/routes/internal.scopeAttestation.api.test.ts",
+        "src/routes/internal.search.api.test.ts",
+        "src/routes/internalAgentApi.auth.test.ts",
+        "src/routes/internalAgentApi.killSwitch.test.ts",
+        "src/routes/internalAgentApi.mcp.test.ts",
+        "src/routes/internalAgentApi.threadRead.test.ts",
+        "src/routes/productEvents.api.test.ts",
+        "src/routes/readMutations.api.test.ts",
+        "src/routes/serverLabs.api.test.ts",
+        "src/routes/servers.transcriptFeedback.api.test.ts",
+        "src/routes/shareArtifacts.api.test.ts",
+        "src/scripts/cleanupEmptyThreadChannels.test.ts",
+        "src/server.slackBridgeLifecycle.contract.test.ts",
+        "src/services/actionCardsMigration.test.ts",
+        "src/services/agentKnowledgeServedBodyLeak.test.ts",
+        "src/services/agentKnowledgeService.runtimeSkills.test.ts",
+        "src/services/agentKnowledgeService.taskClosed.test.ts",
+        "src/services/agentLifecycleReducer.arbitration.test.ts",
+        "src/services/agentO11yScopeDbWriter.test.ts",
+        "src/services/agentOrchestrator.localDeliveryPlan.test.ts",
+        "src/services/agentOrchestrator.resetPlan.test.ts",
+        "src/services/agentOrchestrator.staleTransientPlan.test.ts",
+        "src/services/agentSendReplayService.test.ts",
+        "src/services/agentService.status.test.ts",
+        "src/services/attachmentArtifactInventoryService.test.ts",
+        "src/services/attachmentLifecycleService.realPg.test.ts",
+        "src/services/channelService.risingwaveFailsoft.test.ts",
+        "src/services/channelService.serverIdGuard.test.ts",
+        "src/services/devSeedAgentMembership.test.ts",
+        "src/services/externalAttachmentTransferService.test.ts",
+        "src/services/followedThreadStats.realPg.test.ts",
+        "src/services/inboxRouteBackpressure.test.ts",
+        "src/services/machineCatalogAuthority.test.ts",
+        "src/services/newsletterService.test.ts",
+        "src/services/principalHandleUniqueness.test.ts",
+        "src/services/productFeedbackTiming.test.ts",
+        "src/services/promotedOwnerSetupReconcile.test.ts",
+        "src/services/rapBuiltinAppCriteria.test.ts",
+        "src/services/rapSyscalls.sourceContract.test.ts",
+        "src/services/reminderArmWatchdog.contract.test.ts",
+        "src/services/reminderScheduleInput.test.ts",
+        "src/services/risingWaveInboxSuppressionShape.contract.test.ts",
+        "src/services/serverSetupStateService.test.ts",
+        "src/services/slackBridgeAwsIngressCrypto.test.ts",
+        "src/services/slackBridgeEnvSecrets.test.ts",
+        "src/services/slackBridgeLocalRealAuthority.test.ts",
+        "src/services/slackBridgeProviderProfile.test.ts",
+        "src/services/slackProviderAdapter.test.ts",
+        "src/services/systemMessageBornReadRegistry.test.ts",
+        "src/services/systemNotificationService.test.ts",
+        "src/services/taskRealtimeEvents.test.ts",
+        "src/services/taskService.allShapesOperations.test.ts",
+        "src/services/taskService.resourceReceipt.test.ts",
+        "src/socket/traceMetadata.test.ts",
+        "src/tracing/risingWaveInboxTrace.test.ts"
+      ]
+    },
+    {
+      "shard": 2,
+      "expectedDurationMs": 384618,
+      "files": [
+        "src/apps/reminder/fireTiming.test.ts",
+        "src/config/attachmentPreviewUnified.test.ts",
+        "src/db/attachmentTransferIntentMigration.test.ts",
+        "src/db/awsMigrationTimeoutContract.test.ts",
+        "src/db/computerLifecycleDispatchMigration.test.ts",
+        "src/db/messagesSenderIndexContract.test.ts",
+        "src/db/migrationPreflight.test.ts",
+        "src/db/risingwave.test.ts",
+        "src/routes/actions.privateAccess.api.test.ts",
+        "src/routes/agentMigrationErrors.contract.test.ts",
+        "src/routes/authLoginTrace.test.ts",
+        "src/routes/channels.archive.api.test.ts",
+        "src/routes/featureFlagsAdmin.removed.api.test.ts",
+        "src/routes/guestRbac.api.test.ts",
+        "src/routes/internalAgentApi.wakeHintStream.test.ts",
+        "src/routes/internalAgentKnowledge.api.test.ts",
+        "src/routes/servers.api.test.ts",
+        "src/routes/servers.scopeAttestation.api.test.ts",
+        "src/routes/tasks.channelMembership.api.test.ts",
+        "src/routes/tasks.orphanCleanup.api.test.ts",
+        "src/routes/version.api.test.ts",
+        "src/serverShutdown.test.ts",
+        "src/services/activitySyncPairing.endpoint.test.ts",
+        "src/services/activitySyncService.test.ts",
+        "src/services/agentKnowledgeService.aliases.test.ts",
+        "src/services/agentKnowledgeService.integrationScope.test.ts",
+        "src/services/agentKnowledgeSourcePaths.test.ts",
+        "src/services/agentLifecycleReducer.test.ts",
+        "src/services/agentOrchestrator.ackPlan.test.ts",
+        "src/services/agentOrchestrator.localInboxPlan.test.ts",
+        "src/services/agentOrchestrator.reminderRefusalLog.test.ts",
+        "src/services/agentOrchestrator.routedOwnershipPlan.test.ts",
+        "src/services/agentOrchestrator.statusPlan.test.ts",
+        "src/services/agentScopesService.test.ts",
+        "src/services/attachmentLinkingService.test.ts",
+        "src/services/attachmentObjectBackfillGate.test.ts",
+        "src/services/attachmentPreviews/documentProviders.test.ts",
+        "src/services/billingStripe.test.ts",
+        "src/services/computerLifecycleOperationService.test.ts",
+        "src/services/computerOutageNotificationService.test.ts",
+        "src/services/doneFrontierGuard.test.ts",
+        "src/services/externalAppIngressService.test.ts",
+        "src/services/externalDeliveryOutboxService.test.ts",
+        "src/services/externalInboundAttachmentStorageService.test.ts",
+        "src/services/externalProjectionService.test.ts",
+        "src/services/inboxPolicyModel.latestActivitySeq.test.ts",
+        "src/services/inboxPolicyModel.readState.test.ts",
+        "src/services/inviteService.emailNormalization.test.ts",
+        "src/services/machineContext.test.ts",
+        "src/services/machineService.computerVersion.test.ts",
+        "src/services/mentionDeliveryOccurrenceService.test.ts",
+        "src/services/onboardingEmailJourneyService.test.ts",
+        "src/services/promotedOwnerSetupRace.realPg.test.ts",
+        "src/services/providerConnectionService.test.ts",
+        "src/services/rapRegistryStore.test.ts",
+        "src/services/reminderCancel.contract.test.ts",
+        "src/services/risingWaveInboxFactVisibilityParity.contract.test.ts",
+        "src/services/runtimeFormDefinitionService.test.ts",
+        "src/services/searchService.test.ts",
+        "src/services/seqHeadroomTripwire.health.test.ts",
+        "src/services/sessionService.test.ts",
+        "src/services/slackBridgeAwsSecrets.test.ts",
+        "src/services/slackBridgeInstallGrantService.test.ts",
+        "src/services/slackBridgeProvisioningControlPlane.test.ts",
+        "src/services/slackBridgeWorkerLifecycle.test.ts",
+        "src/services/translation/providers/azure.test.ts",
+        "src/services/unreadSummaryReadState.test.ts",
+        "src/services/wikiManifestService.test.ts",
+        "src/socket/platformScope.test.ts",
+        "src/tracing/decisionTrace.test.ts",
+        "src/tracing/semanticTrace.test.ts",
+        "src/tracing/serverTracer.test.ts"
+      ]
+    },
+    {
+      "shard": 3,
+      "expectedDurationMs": 384618,
+      "files": [
+        "src/app.rateLimit.test.ts",
+        "src/db/appOwnershipMigration.test.ts",
+        "src/db/awsTerraformPlanSafetyContract.test.ts",
+        "src/db/dmChannelIdentityMigration.test.ts",
+        "src/db/messageRandomIdIndexContract.test.ts",
+        "src/db/migrationPhases.test.ts",
+        "src/db/productFeedbackProjectionRemovalMigration.test.ts",
+        "src/db/translationDefaultMigration.test.ts",
+        "src/db/wikiBindingsMigration.test.ts",
+        "src/middleware/auth.test.ts",
+        "src/routes/agents.credentials.gate.test.ts",
+        "src/routes/attachments.api.test.ts",
+        "src/routes/authRefreshTrace.test.ts",
+        "src/routes/channelAdmin.api.test.ts",
+        "src/routes/channelFiles.api.test.ts",
+        "src/routes/channels.membership.api.test.ts",
+        "src/routes/computerLegacyMachines.api.test.ts",
+        "src/routes/daemon.wsAuth.test.ts",
+        "src/routes/errorResponse.test.ts",
+        "src/routes/featureFlagOperatorPreview.api.test.ts",
+        "src/routes/identitySetup.api.test.ts",
+        "src/routes/integrations.api.test.ts",
+        "src/routes/internal.attestedSend.api.test.ts",
+        "src/routes/internal.channelMembership.api.test.ts",
+        "src/routes/internal.reminders.api.test.ts",
+        "src/routes/internal.test.ts",
+        "src/routes/internalAgentApi.feedbackLocator.test.ts",
+        "src/routes/internalAgentApi.migration.test.ts",
+        "src/routes/managedMcp.api.test.ts",
+        "src/routes/messagesThreadSummaries.api.test.ts",
+        "src/routes/productFeedback.api.test.ts",
+        "src/routes/push.api.test.ts",
+        "src/routes/servers.joinCommunity.api.test.ts",
+        "src/routes/timezoneObservation.api.test.ts",
+        "src/services/activitySyncService.normalizeRow.test.ts",
+        "src/services/agentActivityLogService.test.ts",
+        "src/services/agentKnowledgeService.retrievalPath.test.ts",
+        "src/services/agentKnowledgeService.sendIdempotency.test.ts",
+        "src/services/agentKnowledgeService.taskClaimLock.test.ts",
+        "src/services/agentKnowledgeService.threadContextRule.test.ts",
+        "src/services/agentKnowledgeThreadMute.contract.test.ts",
+        "src/services/agentOrchestrator.activityBroadcastPlan.test.ts",
+        "src/services/agentOrchestrator.machineReachabilityPlan.test.ts",
+        "src/services/agentOrchestrator.runtimeModelSource.test.ts",
+        "src/services/agentOrchestrator.stopPlan.test.ts",
+        "src/services/attachmentObjectBackfillRun.test.ts",
+        "src/services/attachmentPreviews/diffPatchProvider.test.ts",
+        "src/services/attachmentTransferIntentService.test.ts",
+        "src/services/billingEntitlements.test.ts",
+        "src/services/bornReadSelfCaused.test.ts",
+        "src/services/canonicalMessageManifest.producer.test.ts",
+        "src/services/channelService.dmLock.test.ts",
+        "src/services/channelService.messageStorageScope.test.ts",
+        "src/services/channelService.risingWaveTrace.contract.test.ts",
+        "src/services/externalAppControlPlaneService.realPg.test.ts",
+        "src/services/externalConversationTargetService.test.ts",
+        "src/services/inboxServingMentionScope.realPg.test.ts",
+        "src/services/managedMcpGateway.test.ts",
+        "src/services/oauthClientRotateSecret.api.test.ts",
+        "src/services/onboardingBriefingOnActivation.test.ts",
+        "src/services/productFeedbackConversationService.test.ts",
+        "src/services/rapAppConfigService.realPg.test.ts",
+        "src/services/rapTimerRuntime.test.ts",
+        "src/services/runtimeAccountUsageSchedule.test.ts",
+        "src/services/slackAudienceRefreshService.test.ts",
+        "src/services/slackBridgeLocalRuntime.test.ts",
+        "src/services/stagingSelfAccountRetirement.realPg.test.ts",
+        "src/services/taskService.amend.test.ts",
+        "src/tracing/otlpHttpTraceSink.test.ts",
+        "src/tracing/routeFailure.test.ts"
+      ]
+    },
+    {
+      "shard": 4,
+      "expectedDurationMs": 384617,
+      "files": [
+        "src/apps/reminder/service.contract.test.ts",
+        "src/db/announcementLifecycleMigration.test.ts",
+        "src/db/featureFlagAdminPrivileges.realPg.test.ts",
+        "src/db/index.test.ts",
+        "src/db/migrateDeploy.test.ts",
+        "src/deployDockerfiles.contract.test.ts",
+        "src/lib/actorPermissions.test.ts",
+        "src/lib/brandedParse.test.ts",
+        "src/routes/attachmentComments.api.test.ts",
+        "src/routes/authIdentityUnlink.api.test.ts",
+        "src/routes/billing.api.test.ts",
+        "src/routes/channels.inbox.api.test.ts",
+        "src/routes/channels.joint.api.test.ts",
+        "src/routes/inboxPressure.realPg.test.ts",
+        "src/routes/internal.agentScope.api.test.ts",
+        "src/routes/internalAgentApi.attachmentComments.test.ts",
+        "src/routes/internalAgentApi.contract.test.ts",
+        "src/routes/messages.api.test.ts",
+        "src/routes/slackBridge.api.test.ts",
+        "src/routes/tasks.assignee.api.test.ts",
+        "src/routes/tasks.realtimeProjection.api.test.ts",
+        "src/routes/tasks.serverPagination.api.test.ts",
+        "src/services/activitySyncService.realPg.test.ts",
+        "src/services/activityUnreadTotalsBatch.oracle.test.ts",
+        "src/services/agentKnowledgeService.integration.test.ts",
+        "src/services/agentKnowledgeService.searchExactMatch.test.ts",
+        "src/services/agentLifecycleEvents.test.ts",
+        "src/services/agentLifecycleReducer.shadow.test.ts",
+        "src/services/agentMigrationLegacyRepairService.test.ts",
+        "src/services/agentOrchestrator.activityHintPlan.test.ts",
+        "src/services/agentOrchestrator.deterministic.test.ts",
+        "src/services/agentOrchestrator.legacyReminderFireAttempt.test.ts",
+        "src/services/agentOrchestrator.mentionRedrivePlan.test.ts",
+        "src/services/agentOrchestrator.runtimeProfileSource.test.ts",
+        "src/services/agentOrchestrator.wakePlan.test.ts",
+        "src/services/attachmentPreviews/registry.test.ts",
+        "src/services/attachmentUploadSessionService.test.ts",
+        "src/services/channelService.allMembership.test.ts",
+        "src/services/computerVersionService.test.ts",
+        "src/services/daemonVersionService.test.ts",
+        "src/services/devSeedOnboardingState.test.ts",
+        "src/services/externalDeliveryWorkerService.test.ts",
+        "src/services/externalInboundWorkerService.realPg.test.ts",
+        "src/services/externalProjectionAuthority.contract.test.ts",
+        "src/services/externalReactionSyncService.test.ts",
+        "src/services/messageService.summarize.test.ts",
+        "src/services/messageService.threadJoinContext.test.ts",
+        "src/services/oauthService.test.ts",
+        "src/services/planService.test.ts",
+        "src/services/productFeedbackRouting.integration.test.ts",
+        "src/services/productFeedbackService.test.ts",
+        "src/services/pushDisplay.test.ts",
+        "src/services/pushService.test.ts",
+        "src/services/rapHookEnvelopeSync.test.ts",
+        "src/services/rapSyscalls.test.ts",
+        "src/services/recurrence.test.ts",
+        "src/services/reminderArmWatchdogFairness.contract.test.ts",
+        "src/services/risingWaveInboxBornReadParity.contract.test.ts",
+        "src/services/scopeDbSdkPolicy.test.ts",
+        "src/services/scopeDbSdkUsage.contract.test.ts",
+        "src/services/serverLabReadConsistency.test.ts",
+        "src/services/serverService.announcementGate.test.ts",
+        "src/services/slackBridgeServerRuntime.test.ts",
+        "src/services/taskService.assignment.realPg.test.ts",
+        "src/services/userService.emailNormalization.test.ts",
+        "src/test/slackBridgeFullFlowHarness.test.ts",
+        "src/test/slackBridgeOutboundBatchMatrix.test.ts",
+        "src/tracing/sendRouteFailure.test.ts",
+        "src/version.test.ts"
+      ]
+    },
+    {
+      "shard": 5,
+      "expectedDurationMs": 384617,
+      "files": [
+        "src/appFallback.api.test.ts",
+        "src/db/inboxAutoanalyzeMigration.test.ts",
+        "src/db/migrateDeploy.realPg.test.ts",
+        "src/db/migrationTimeoutContract.test.ts",
+        "src/db/pgliteMigrations.test.ts",
+        "src/db/repairDmDuplicateChannels.test.ts",
+        "src/db/slackBridgeOutboxSchema.test.ts",
+        "src/db/timezoneObservationMigration.test.ts",
+        "src/lib/readStateDelegation.test.ts",
+        "src/machineLocalReplay.test.ts",
+        "src/replicaRouter.inboxReceipt.test.ts",
+        "src/routes/agentDiscovery.api.test.ts",
+        "src/routes/agentLogin.gate.test.ts",
+        "src/routes/attachmentUploadSessions.api.test.ts",
+        "src/routes/channels.getJoined.api.test.ts",
+        "src/routes/externalProjectionReactionRoutes.test.ts",
+        "src/routes/internal.profile.api.test.ts",
+        "src/routes/internal.runtimeProfile.api.test.ts",
+        "src/routes/internalAgentApi.registryParity.test.ts",
+        "src/routes/internalAgentApi.send.test.ts",
+        "src/routes/internalComputer.agentMigration.test.ts",
+        "src/routes/messageTranslations.api.test.ts",
+        "src/routes/notifications.api.test.ts",
+        "src/routes/oauthServerinfo.contract.test.ts",
+        "src/routes/reminders.api.test.ts",
+        "src/routes/tasks.shapeSurfaces.api.test.ts",
+        "src/services/activityUnreadTotalsBatch.explain.realPg.test.ts",
+        "src/services/agentDaemonReleaseNotes.test.ts",
+        "src/services/agentKnowledgeService.discovery.test.ts",
+        "src/services/agentKnowledgeService.membershipRbac.test.ts",
+        "src/services/agentMigrationLegacyRepairService.realPg.test.ts",
+        "src/services/agentMigrationRealtime.test.ts",
+        "src/services/agentMigrationReceiptService.test.ts",
+        "src/services/agentOrchestrator.activityPlan.test.ts",
+        "src/services/agentOrchestrator.appRuntimeTrace.e2e.test.ts",
+        "src/services/agentOrchestrator.appRuntimeTrace.test.ts",
+        "src/services/agentOrchestrator.mentionRedriveDelivery.test.ts",
+        "src/services/agentOrchestrator.readyPlan.test.ts",
+        "src/services/agentOrchestrator.sendToMachinePlan.test.ts",
+        "src/services/agentRuntimeProfileService.test.ts",
+        "src/services/appOutboundPermissionService.test.ts",
+        "src/services/appWebhookConfigService.test.ts",
+        "src/services/attachmentLifecycleService.test.ts",
+        "src/services/attachmentPreviewBridge.test.ts",
+        "src/services/attachmentProjectionRevocationService.test.ts",
+        "src/services/attachmentProjectionWriterService.test.ts",
+        "src/services/channelLifecycle.realPg.test.ts",
+        "src/services/externalInboundWorkerService.test.ts",
+        "src/services/externalReactionEmojiMap.test.ts",
+        "src/services/featureFlagRolloutWriterService.test.ts",
+        "src/services/fileUploadQuotaService.test.ts",
+        "src/services/inboxNotificationService.test.ts",
+        "src/services/inboxPolicyModel.test.ts",
+        "src/services/integrationAuditService.test.ts",
+        "src/services/legacyAttachmentCleanerArm.contract.test.ts",
+        "src/services/managedMcpOAuthService.test.ts",
+        "src/services/messageResourceRefs.contract.test.ts",
+        "src/services/nativeNotificationService.test.ts",
+        "src/services/onboardingService.test.ts",
+        "src/services/ordinaryMessageExternalProjection.test.ts",
+        "src/services/productFeedbackRouteSubject.test.ts",
+        "src/services/readMutationSequencer.realPg.test.ts",
+        "src/services/readMutationSequencer.test.ts",
+        "src/services/runtimeAdmissionService.test.ts",
+        "src/services/searchSenderIndex.realPg.test.ts",
+        "src/services/serverSetupReset.test.ts",
+        "src/services/slackBridgeDatabaseRuntimeAuthority.test.ts",
+        "src/services/socialAuthService.test.ts",
+        "src/services/storageOrphanCleanupService.test.ts",
+        "src/services/taskService.mixedSource.test.ts",
+        "src/services/taskService.transition.test.ts",
+        "src/wikiWorkspacePack.contract.test.ts"
+      ]
+    },
+    {
+      "shard": 6,
+      "expectedDurationMs": 384617,
+      "files": [
+        "src/apps/reminder/protocolTransition.test.ts",
+        "src/db/attachmentArtifactInventoryMigration.test.ts",
+        "src/db/migrationPhases.realPg.test.ts",
+        "src/metrics.test.ts",
+        "src/middleware/agentRouteScopeCoverage.test.ts",
+        "src/middleware/perfAttribution.test.ts",
+        "src/middleware/requestObservability.test.ts",
+        "src/routes/agentCredentials.api.test.ts",
+        "src/routes/agents.api.test.ts",
+        "src/routes/attachmentPreviewBridge.api.test.ts",
+        "src/routes/channels.joinCapability.api.test.ts",
+        "src/routes/channels.membersBatch.api.test.ts",
+        "src/routes/channels.threads.api.test.ts",
+        "src/routes/errorHygieneBlackbox.api.test.ts",
+        "src/routes/featureFlags.api.test.ts",
+        "src/routes/internalAgentApi.appConfig.test.ts",
+        "src/routes/internalAgentApi.cursorRebuild.test.ts",
+        "src/routes/internalComputer.runners.test.ts",
+        "src/routes/oauth.api.test.ts",
+        "src/routes/oauthServerinfoDocs.contract.test.ts",
+        "src/routes/oidc.api.test.ts",
+        "src/routes/providerConnections.api.test.ts",
+        "src/routes/serverSetupGate.daemonReady.test.ts",
+        "src/routes/servers.activityUnreadSummary.api.test.ts",
+        "src/routes/servers.mentionRedriveAuthz.api.test.ts",
+        "src/routes/tasks.jointSurface.api.test.ts",
+        "src/runServerShardWithWatchdog.test.ts",
+        "src/services/agentActivityCompatibility.test.ts",
+        "src/services/agentKnowledgeService.searchFuzzy.test.ts",
+        "src/services/agentLifecycleReducer.property.test.ts",
+        "src/services/agentMigrationReceiptOrdering.realPg.test.ts",
+        "src/services/agentMigrationService.test.ts",
+        "src/services/agentOrchestrator.launchGuardVersion.test.ts",
+        "src/services/agentOrchestrator.receivePlan.test.ts",
+        "src/services/agentOrchestrator.runtimeProfileHotPath.test.ts",
+        "src/services/agentOrchestrator.sessionPlan.test.ts",
+        "src/services/agentPermalinkRenderService.test.ts",
+        "src/services/announcementOldestFirst.test.ts",
+        "src/services/appConfigTransportComposition.test.ts",
+        "src/services/appNotificationDeliveryService.test.ts",
+        "src/services/appOutboundProjectionService.test.ts",
+        "src/services/builtinModelCatalogCompatibility.test.ts",
+        "src/services/channelService.channelRef.test.ts",
+        "src/services/computerMobileAppEmailJourneyService.test.ts",
+        "src/services/doneFrontierGuard.pg.test.ts",
+        "src/services/externalAppControlPlaneService.test.ts",
+        "src/services/externalOutboundAttachmentCoordinator.test.ts",
+        "src/services/featureFlagRolloutWriterService.realPg.test.ts",
+        "src/services/getting-started.test.ts",
+        "src/services/inboxMutePolicy.test.ts",
+        "src/services/inboxSuppressionWriters.contract.test.ts",
+        "src/services/managedMcpCredentialService.test.ts",
+        "src/services/messageMentions.contract.test.ts",
+        "src/services/messageService.test.ts",
+        "src/services/onboardingService.activationPlan.test.ts",
+        "src/services/persistedMessageFactEmission.test.ts",
+        "src/services/rapAppConfigService.test.ts",
+        "src/services/registrationPolicy.test.ts",
+        "src/services/seqHeadroomTripwire.test.ts",
+        "src/services/slackInboundAttachmentAdapter.test.ts",
+        "src/services/taskService.claim.test.ts",
+        "src/services/taskService.creatorMembership.test.ts",
+        "src/services/translation/placeholderValidator.test.ts",
+        "src/services/translation/providers/volcengine.test.ts",
+        "src/test/integration/database.contract.test.ts",
+        "src/tracing/queryTrace.test.ts",
+        "src/tracing/scopeDbTraceEventSink.test.ts",
+        "src/tracing/traceDeploymentIdentity.test.ts"
+      ]
+    },
+    {
+      "shard": 7,
+      "expectedDurationMs": 384617,
+      "files": [
+        "src/apps/cleaner/configProjector.test.ts",
+        "src/apps/reminder/crud.test.ts",
+        "src/apps/reminder/recurrenceSlotAnchor.contract.test.ts",
+        "src/apps/reminder/service.realPg.test.ts",
+        "src/config/attachmentDirectUpload.test.ts",
+        "src/db/agentKnowledgeTelemetryMigration.test.ts",
+        "src/db/featureFlagAdminPrivileges.test.ts",
+        "src/db/migrationPreflight.realPg.test.ts",
+        "src/db/slackBridgeControlPlaneMigration.test.ts",
+        "src/middleware/raftdevActivity.test.ts",
+        "src/routes/announcements.api.test.ts",
+        "src/routes/appAdmin.removed.api.test.ts",
+        "src/routes/auth.api.test.ts",
+        "src/routes/channels.api.test.ts",
+        "src/routes/deviceAuth.api.test.ts",
+        "src/routes/internalAgentApi.crossReplicaWake.test.ts",
+        "src/routes/internalAgentApi.eventsSenderType.test.ts",
+        "src/routes/internalAgentApi.mentionActions.test.ts",
+        "src/routes/internalComputer.agentO11y.api.test.ts",
+        "src/routes/internalComputer.preflight.test.ts",
+        "src/routes/mobileDownload.test.ts",
+        "src/routes/otlpRelay.test.ts",
+        "src/routes/serverAgreements.api.test.ts",
+        "src/routes/systemNotifications.api.test.ts",
+        "src/routes/wiki.api.test.ts",
+        "src/routes/workflows.api.test.ts",
+        "src/runTestShard.test.ts",
+        "src/services/agentCredentialService.capabilities.test.ts",
+        "src/services/agentKnowledgeAppTopic.test.ts",
+        "src/services/agentKnowledgeService.loginWithRaft.test.ts",
+        "src/services/agentKnowledgeService.mention.test.ts",
+        "src/services/agentMigrationWorkerObservability.test.ts",
+        "src/services/agentOrchestrator.lifecycleAcceptancePlan.test.ts",
+        "src/services/agentOrchestrator.mentionIdentityFallback.test.ts",
+        "src/services/agentOrchestrator.reminderArmRejected.test.ts",
+        "src/services/agentOrchestrator.reminderReceiptPlan.test.ts",
+        "src/services/agentOrchestrator.staleActivityPlan.test.ts",
+        "src/services/agentService.batchEnrich.test.ts",
+        "src/services/agentService.secondAgentEvent.test.ts",
+        "src/services/attachmentAuthorityService.test.ts",
+        "src/services/attachmentCommentAnchorLabel.test.ts",
+        "src/services/attachmentObjectBackfillService.test.ts",
+        "src/services/attachmentUploadWriterService.test.ts",
+        "src/services/channelConversionService.test.ts",
+        "src/services/channelService.risingwavePrepare.realRw.test.ts",
+        "src/services/computerBroadcastPolicyService.test.ts",
+        "src/services/emailService.test.ts",
+        "src/services/externalAgentNotificationSender.removal.contract.test.ts",
+        "src/services/externalAvatarMaterializerService.test.ts",
+        "src/services/externalReactionWorkerService.test.ts",
+        "src/services/featureFlagService.test.ts",
+        "src/services/followedThreadFrontier.test.ts",
+        "src/services/legacyAgentLifecycleAdapter.runtimeError.test.ts",
+        "src/services/managedMcpService.test.ts",
+        "src/services/messageRealtimeEvents.test.ts",
+        "src/services/productEventsService.test.ts",
+        "src/services/productFeedbackLocatorService.test.ts",
+        "src/services/rapRegistry.test.ts",
+        "src/services/reminderRapCallers.contract.test.ts",
+        "src/services/reminderRecurring.contract.test.ts",
+        "src/services/runtimeAccountUsageCacheService.test.ts",
+        "src/services/serverNotificationPreferences.test.ts",
+        "src/services/serverSettingsService.test.ts",
+        "src/services/slackBridgeManagedRuntime.test.ts",
+        "src/services/slackBridgeProductionAppContract.test.ts",
+        "src/services/slackBridgeProductionComposition.test.ts",
+        "src/services/slackBridgeRuntimeService.test.ts",
+        "src/services/storageService.test.ts",
+        "src/services/translation/providers/google.test.ts",
+        "src/services/userService.onboardingEmailJourney.test.ts",
+        "src/services/userService.usernameUniqueness.test.ts",
+        "src/socket/index.test.ts",
+        "src/test/integration/lifecycle.contract.test.ts"
+      ]
+    }
+  ]
+}

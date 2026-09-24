@@ -1,0 +1,467 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-09-06T16:30:48.519Z",
+  "sourceCommit": "4af93ff026213eab9a127857143989dedfeafe8f",
+  "nodeVersion": "v24.15.0",
+  "shardCount": 6,
+  "totalFiles": 66,
+  "totalDurationMsLocal": 344816,
+  "maxFileDurationMsLocal": 34258,
+  "profileVerdict": "failed_but_timed",
+  "profileFailureReasons": [
+    "failed_spec",
+    "process_nonzero",
+    "unexpected_tests"
+  ],
+  "profileProcessOutcome": "nonzero",
+  "profileGlobalErrorCount": 0,
+  "profileStats": {
+    "startTime": "2026-09-06T16:24:49.745Z",
+    "duration": 358751.474,
+    "expected": 163,
+    "skipped": 0,
+    "unexpected": 4,
+    "flaky": 0
+  },
+  "failedProfileFiles": [
+    "tests/e2e/tests/scroll-restore-alignment.spec.ts",
+    "tests/e2e/tests/select/select-mode-smoke.spec.ts",
+    "tests/e2e/tests/sidebar/custom-sections.spec.ts"
+  ],
+  "fileTimings": [
+    {
+      "file": "tests/e2e/tests/select/select-mode-smoke.spec.ts",
+      "durationMs": 34258,
+      "profileStatus": "failed"
+    },
+    {
+      "file": "tests/e2e/tests/document-attachment-previews.spec.ts",
+      "durationMs": 20517,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/thread/sparse-anchor.spec.ts",
+      "durationMs": 19904,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/mobile/back-navigation.spec.ts",
+      "durationMs": 16032,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/thread/inbox-contract.spec.ts",
+      "durationMs": 15695,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/sidebar/custom-sections.spec.ts",
+      "durationMs": 14239,
+      "profileStatus": "failed"
+    },
+    {
+      "file": "tests/e2e/tests/message-list-stability.spec.ts",
+      "durationMs": 14236,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/sidebar/removed-dm-menu-actions.spec.ts",
+      "durationMs": 14154,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/thread/open-preserves-channel-list.spec.ts",
+      "durationMs": 11672,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/thread/search-lazy-hydration.spec.ts",
+      "durationMs": 9349,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/select/select-image-shot.spec.ts",
+      "durationMs": 9345,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/thread/open-new-tab-opener.spec.ts",
+      "durationMs": 8186,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/sidebar/unread-click-read.spec.ts",
+      "durationMs": 7763,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/scroll-restore-alignment.spec.ts",
+      "durationMs": 7635,
+      "profileStatus": "failed"
+    },
+    {
+      "file": "tests/e2e/tests/thread/view-in-channel-routing.spec.ts",
+      "durationMs": 6934,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/select/select-copy-md-shots.spec.ts",
+      "durationMs": 6730,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/thread/task-status-sync-from-main-panel.spec.ts",
+      "durationMs": 6399,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/task/channel-task-board-view.spec.ts",
+      "durationMs": 6388,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/channel/send-message.spec.ts",
+      "durationMs": 6331,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/mermaid-message.spec.ts",
+      "durationMs": 6186,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/search/thread-hit-first-click.spec.ts",
+      "durationMs": 5549,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/onboarding-wizard.spec.ts",
+      "durationMs": 4428,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/mobile/tab-bar-sidebar.spec.ts",
+      "durationMs": 4235,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/search/empty-escape-routing.spec.ts",
+      "durationMs": 4134,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/thread/escape-close.spec.ts",
+      "durationMs": 3990,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/settings-server.spec.ts",
+      "durationMs": 3871,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/audio-attachment-player.spec.ts",
+      "durationMs": 3818,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/select/select-thread-share.spec.ts",
+      "durationMs": 3697,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/thread/view-in-channel-profile-close.spec.ts",
+      "durationMs": 3597,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/select/select-avatar-shot.spec.ts",
+      "durationMs": 3291,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/search/rail-reclick-flicker.spec.ts",
+      "durationMs": 3234,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/channel/back-to-bottom.spec.ts",
+      "durationMs": 3175,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/announcement-modal.spec.ts",
+      "durationMs": 3012,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/thread/watcher-realtime.spec.ts",
+      "durationMs": 2925,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/composer-drag-drop.spec.ts",
+      "durationMs": 2759,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/agents/agent-detail-visibility.spec.ts",
+      "durationMs": 2567,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/dm/send-receive.spec.ts",
+      "durationMs": 2341,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/thread/task-status-sync.spec.ts",
+      "durationMs": 2286,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/image-lightbox-backdrop.spec.ts",
+      "durationMs": 2211,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/thread/resize-preserves-channel-composer.spec.ts",
+      "durationMs": 2157,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/render-perf/sidebar-click-2640.spec.ts",
+      "durationMs": 2147,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/select/select-mode-rightclick-suppressed.spec.ts",
+      "durationMs": 2113,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/mobile/quoted-preview-spacing.spec.ts",
+      "durationMs": 2094,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/sidebar/chat-tab-from-machine-detail.spec.ts",
+      "durationMs": 2064,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/detail-panel-layout.spec.ts",
+      "durationMs": 2054,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/channel/joint-permalink-preview.spec.ts",
+      "durationMs": 2015,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/thread/reopen-consistency.spec.ts",
+      "durationMs": 1981,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/thread/sidebar-dblclick.spec.ts",
+      "durationMs": 1888,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/thread/inbox-mentions-filter.spec.ts",
+      "durationMs": 1838,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/search/archived-channel-search.spec.ts",
+      "durationMs": 1684,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/channel/mention-popover-channel-switch.spec.ts",
+      "durationMs": 1585,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/mobile/ios-standalone-chrome.spec.ts",
+      "durationMs": 1513,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/thread/inline-replies-cold-entry.spec.ts",
+      "durationMs": 1336,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/leftrail-square-slot.spec.ts",
+      "durationMs": 1212,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/short-channel-anchor.spec.ts",
+      "durationMs": 1186,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/auth/login.spec.ts",
+      "durationMs": 1162,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/members/sidebar-query-contract.spec.ts",
+      "durationMs": 1124,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/channel/chat-realtime.smoke.spec.ts",
+      "durationMs": 901,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/channel/join-permission.spec.ts",
+      "durationMs": 894,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/channel/joint-add-member.spec.ts",
+      "durationMs": 886,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/agents/claude-model-picker.spec.ts",
+      "durationMs": 881,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/channel/mention-member-refresh.spec.ts",
+      "durationMs": 860,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/auth/register.spec.ts",
+      "durationMs": 804,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/desktop-document-handshake.spec.ts",
+      "durationMs": 557,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/layout-color-contract.spec.ts",
+      "durationMs": 418,
+      "profileStatus": "passed"
+    },
+    {
+      "file": "tests/e2e/tests/settings-account-preferences.spec.ts",
+      "durationMs": 389,
+      "profileStatus": "passed"
+    }
+  ],
+  "shards": [
+    {
+      "shard": 1,
+      "expectedDurationMs": 57342,
+      "files": [
+        "tests/e2e/tests/auth/login.spec.ts",
+        "tests/e2e/tests/auth/register.spec.ts",
+        "tests/e2e/tests/composer-drag-drop.spec.ts",
+        "tests/e2e/tests/mobile/tab-bar-sidebar.spec.ts",
+        "tests/e2e/tests/render-perf/sidebar-click-2640.spec.ts",
+        "tests/e2e/tests/select/select-mode-smoke.spec.ts",
+        "tests/e2e/tests/thread/reopen-consistency.spec.ts",
+        "tests/e2e/tests/thread/task-status-sync-from-main-panel.spec.ts",
+        "tests/e2e/tests/thread/view-in-channel-profile-close.spec.ts"
+      ]
+    },
+    {
+      "shard": 2,
+      "expectedDurationMs": 57397,
+      "files": [
+        "tests/e2e/tests/channel/joint-add-member.spec.ts",
+        "tests/e2e/tests/channel/mention-popover-channel-switch.spec.ts",
+        "tests/e2e/tests/detail-panel-layout.spec.ts",
+        "tests/e2e/tests/document-attachment-previews.spec.ts",
+        "tests/e2e/tests/mermaid-message.spec.ts",
+        "tests/e2e/tests/select/select-copy-md-shots.spec.ts",
+        "tests/e2e/tests/select/select-image-shot.spec.ts",
+        "tests/e2e/tests/select/select-thread-share.spec.ts",
+        "tests/e2e/tests/short-channel-anchor.spec.ts",
+        "tests/e2e/tests/thread/task-status-sync.spec.ts",
+        "tests/e2e/tests/thread/watcher-realtime.spec.ts"
+      ]
+    },
+    {
+      "shard": 3,
+      "expectedDurationMs": 57381,
+      "files": [
+        "tests/e2e/tests/agents/agent-detail-visibility.spec.ts",
+        "tests/e2e/tests/channel/mention-member-refresh.spec.ts",
+        "tests/e2e/tests/leftrail-square-slot.spec.ts",
+        "tests/e2e/tests/onboarding-wizard.spec.ts",
+        "tests/e2e/tests/scroll-restore-alignment.spec.ts",
+        "tests/e2e/tests/search/empty-escape-routing.spec.ts",
+        "tests/e2e/tests/select/select-avatar-shot.spec.ts",
+        "tests/e2e/tests/select/select-mode-rightclick-suppressed.spec.ts",
+        "tests/e2e/tests/thread/search-lazy-hydration.spec.ts",
+        "tests/e2e/tests/thread/sidebar-dblclick.spec.ts",
+        "tests/e2e/tests/thread/sparse-anchor.spec.ts"
+      ]
+    },
+    {
+      "shard": 4,
+      "expectedDurationMs": 57716,
+      "files": [
+        "tests/e2e/tests/channel/back-to-bottom.spec.ts",
+        "tests/e2e/tests/channel/chat-realtime.smoke.spec.ts",
+        "tests/e2e/tests/channel/join-permission.spec.ts",
+        "tests/e2e/tests/mobile/back-navigation.spec.ts",
+        "tests/e2e/tests/mobile/quoted-preview-spacing.spec.ts",
+        "tests/e2e/tests/settings-account-preferences.spec.ts",
+        "tests/e2e/tests/task/channel-task-board-view.spec.ts",
+        "tests/e2e/tests/thread/escape-close.spec.ts",
+        "tests/e2e/tests/thread/inbox-mentions-filter.spec.ts",
+        "tests/e2e/tests/thread/open-new-tab-opener.spec.ts",
+        "tests/e2e/tests/thread/open-preserves-channel-list.spec.ts",
+        "tests/e2e/tests/thread/resize-preserves-channel-composer.spec.ts"
+      ]
+    },
+    {
+      "shard": 5,
+      "expectedDurationMs": 57401,
+      "files": [
+        "tests/e2e/tests/agents/claude-model-picker.spec.ts",
+        "tests/e2e/tests/image-lightbox-backdrop.spec.ts",
+        "tests/e2e/tests/members/sidebar-query-contract.spec.ts",
+        "tests/e2e/tests/search/archived-channel-search.spec.ts",
+        "tests/e2e/tests/search/rail-reclick-flicker.spec.ts",
+        "tests/e2e/tests/search/thread-hit-first-click.spec.ts",
+        "tests/e2e/tests/settings-server.spec.ts",
+        "tests/e2e/tests/sidebar/chat-tab-from-machine-detail.spec.ts",
+        "tests/e2e/tests/sidebar/removed-dm-menu-actions.spec.ts",
+        "tests/e2e/tests/thread/inbox-contract.spec.ts",
+        "tests/e2e/tests/thread/view-in-channel-routing.spec.ts"
+      ]
+    },
+    {
+      "shard": 6,
+      "expectedDurationMs": 57579,
+      "files": [
+        "tests/e2e/tests/announcement-modal.spec.ts",
+        "tests/e2e/tests/audio-attachment-player.spec.ts",
+        "tests/e2e/tests/channel/joint-permalink-preview.spec.ts",
+        "tests/e2e/tests/channel/send-message.spec.ts",
+        "tests/e2e/tests/desktop-document-handshake.spec.ts",
+        "tests/e2e/tests/dm/send-receive.spec.ts",
+        "tests/e2e/tests/layout-color-contract.spec.ts",
+        "tests/e2e/tests/message-list-stability.spec.ts",
+        "tests/e2e/tests/mobile/ios-standalone-chrome.spec.ts",
+        "tests/e2e/tests/sidebar/custom-sections.spec.ts",
+        "tests/e2e/tests/sidebar/unread-click-read.spec.ts",
+        "tests/e2e/tests/thread/inline-replies-cold-entry.spec.ts"
+      ]
+    }
+  ]
+}

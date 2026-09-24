@@ -1,0 +1,9 @@
+# Presence of this file makes the updater active in a dev/unpackaged run (see
+# hasUpdateConfig in src/main/autoUpdater.ts), so the update flow can be
+# exercised locally. It points at the same generic feed as the release publish
+# config; against a placeholder/unreachable feed the check fails silently, which
+# is the intended dev behavior. Not shipped in packaged builds — electron-builder
+# generates the real app-update.yml from the publish config.
+provider: generic
+url: https://desktop-updates.raft.build
+updaterCacheDirName: raft-desktop-electron-updater

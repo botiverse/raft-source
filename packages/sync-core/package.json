@@ -1,0 +1,30 @@
+{
+  "name": "@botiverse/raft-sync-core",
+  "version": "0.1.0",
+  "license": "FSL-1.1-ALv2",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "contract:activity:generate:kotlin": "node contracts/activity-v1/tools/generate-kotlin.mjs",
+    "contract:activity:generate:manifest": "node contracts/activity-v1/tools/write-manifest.mjs",
+    "contract:activity:generate:schemas": "pnpm exec tsp compile contracts/activity-v1/activity-sync.tsp --config contracts/activity-v1/tspconfig.yaml",
+    "contract:activity:generate:typescript": "node contracts/activity-v1/tools/generate-typescript.mjs",
+    "contract:activity:regen": "pnpm run contract:activity:generate:schemas && pnpm run contract:activity:generate:typescript && pnpm run contract:activity:generate:kotlin && pnpm run contract:activity:generate:manifest",
+    "contract:activity:verify": "node contracts/activity-v1/tools/verify-contract.mjs && node contracts/activity-v1/tools/verify-typescript-leg.mjs && node contracts/activity-v1/tools/verify-typescript-leg-mutations.mjs",
+    "test": "node --import tsx --test 'src/**/*.test.ts' 'contracts/**/*.test.ts'",
+    "test:coverage": "node --import tsx --experimental-test-coverage --test-coverage-include='src/*.ts' --test-coverage-exclude='src/*.test.ts' --test-coverage-exclude='src/types.ts' --test-coverage-lines=95 --test-coverage-branches=90 --test-coverage-functions=85 --test src/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "@typespec/compiler": "1.14.0",
+    "@typespec/http": "1.14.0",
+    "@typespec/json-schema": "1.14.0",
+    "@typespec/openapi3": "1.14.0",
+    "ajv": "8.17.1",
+    "tsx": "^4.21.0",
+    "typescript": "5.9.3"
+  }
+}
